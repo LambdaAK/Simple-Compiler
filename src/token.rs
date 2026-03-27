@@ -5,17 +5,15 @@ pub enum Token {
     // --- keywords ---
     KwInt,
     KwBool,
+    KwVoid,
     KwIf,
     KwWhile,
     KwFor,
     KwElse,
+    KwReturn,
     KwTrue,
     KwFalse,
-    KwPrintInt,
-    KwPrintBool,
     KwChar,
-    KwPrintChar,
-    KwPrintString,
 
     // --- identifiers & literals ---
     Ident(String),
@@ -81,17 +79,15 @@ impl Token {
         let tok = match ident {
             "int" => Token::KwInt,
             "bool" => Token::KwBool,
+            "void" => Token::KwVoid,
             "if" => Token::KwIf,
             "while" => Token::KwWhile,
             "for" => Token::KwFor,
             "else" => Token::KwElse,
+            "return" => Token::KwReturn,
             "true" => Token::KwTrue,
             "false" => Token::KwFalse,
-            "print_int" => Token::KwPrintInt,
-            "print_bool" => Token::KwPrintBool,
             "char" => Token::KwChar,
-            "print_char" => Token::KwPrintChar,
-            "print_string" => Token::KwPrintString,
             _ => return None,
         };
         Some(tok)

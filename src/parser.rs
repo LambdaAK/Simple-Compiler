@@ -1,6 +1,6 @@
 //! Recursive-descent parser for the README grammar (`program` → `stmt*` → `expr` with C-like precedence).
 
-use crate::ast::{BinOp, Expr, Program, Stmt, Ty, UnaryOp};
+use crate::ast::{BinOp, Expr, Item, Program, RetTy, Stmt, Ty, UnaryOp};
 use crate::lexer::{lex, LexError};
 use crate::token::Token;
 
@@ -79,11 +79,145 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_program(&mut self) -> Result<Program, FrontEndError> {
-        let mut stmts = Vec::new();
+        let mut items = Vec::new();
         while !matches!(self.peek(), Token::Eof) {
-            stmts.push(self.parse_stmt()?);
+            items.push(self.parse_item()?);
         }
-        Ok(Program { stmts })
+        Ok(Program { items })
+    }
+
+    fn parse_item(&mut self) -> Result<Item, FrontEndError> {
+        match self.peek().clone() {
+            Token::KwVoid => {
+                self.bump();
+                let name = self.expect_ident()?;
+                self.consume(Token::LParen, "`(`")?;
+                let params = self.parse_param_list()?;
+                self.consume(Token::RParen, "`)`")?;
+                match self.peek().clone() {
+                    Token::Semicolon => {
+                        self.bump();
+                        Ok(Item::FnDecl {
+                            name,
+                            params,
+                            ret: RetTy::Void,
+                        })
+                    }
+                    Token::LBrace => {
+                        let body = self.parse_block()?;
+                        Ok(Item::FnDef {
+                            name,
+                            params,
+                            ret: RetTy::Void,
+                            body,
+                        })
+                    }
+                    other => Err(self
+                        .error(format!(
+                            "expected `;` or `{{` after `void {name}(...)`, found `{other:?}`"
+                        ))
+                        .into()),
+                }
+            }
+            Token::KwInt | Token::KwBool | Token::KwChar => {
+                let ty = match self.peek() {
+                    Token::KwInt => Ty::Int,
+                    Token::KwBool => Ty::Bool,
+                    Token::KwChar => Ty::Char,
+                    _ => unreachable!(),
+                };
+                self.bump();
+                let name = self.expect_ident()?;
+                if matches!(self.peek(), Token::LParen) {
+                    self.bump();
+                    let params = self.parse_param_list()?;
+                    self.consume(Token::RParen, "`)`")?;
+                    let ret = RetTy::Scalar(ty);
+                    match self.peek().clone() {
+                        Token::Semicolon => {
+                            self.bump();
+                            Ok(Item::FnDecl {
+                                name,
+                                params,
+                                ret,
+                            })
+                        }
+                        Token::LBrace => {
+                            let body = self.parse_block()?;
+                            Ok(Item::FnDef {
+                                name,
+                                params,
+                                ret,
+                                body,
+                            })
+                        }
+                        other => Err(self
+                            .error(format!(
+                                "expected `;` or `{{` after function header, found `{other:?}`"
+                            ))
+                            .into()),
+                    }
+                } else {
+                    let stmt = self.decl_tail_for_var(ty, name)?;
+                    self.consume(Token::Semicolon, "`;`")?;
+                    Ok(Item::Stmt(stmt))
+                }
+            }
+            _ => Ok(Item::Stmt(self.parse_stmt()?)),
+        }
+    }
+
+    fn parse_param_ty(&mut self) -> Result<Ty, FrontEndError> {
+        match self.peek().clone() {
+            Token::KwInt => {
+                self.bump();
+                Ok(Ty::Int)
+            }
+            Token::KwBool => {
+                self.bump();
+                Ok(Ty::Bool)
+            }
+            Token::KwChar => {
+                self.bump();
+                Ok(Ty::Char)
+            }
+            other => Err(self
+                .error(format!(
+                    "parameter type must be `int`, `bool`, or `char`, found `{other:?}`"
+                ))
+                .into()),
+        }
+    }
+
+    fn parse_param_list(&mut self) -> Result<Vec<(String, Ty)>, FrontEndError> {
+        let mut params = Vec::new();
+        if matches!(self.peek(), Token::RParen) {
+            return Ok(params);
+        }
+        loop {
+            let ty = self.parse_param_ty()?;
+            let pname = self.expect_ident()?;
+            params.push((pname, ty));
+            match self.peek().clone() {
+                Token::Comma => {
+                    self.bump();
+                    if matches!(self.peek(), Token::RParen) {
+                        return Err(self
+                            .error("trailing `,` in parameter list is not allowed")
+                            .into());
+                    }
+                }
+                Token::RParen => break,
+                other => {
+                    return Err(self
+                        .error(format!(
+                            "expected `,` or `)` in parameter list, found `{other:?}`"
+                        ))
+                        .into());
+                }
+            }
+        }
+        Ok(params)
     }
 
     fn parse_stmt(&mut self) -> Result<Stmt, FrontEndError> {
@@ -106,37 +240,15 @@ impl<'a> Parser<'a> {
                 self.consume(Token::Semicolon, "`;`")?;
                 Ok(s)
             }
-            Token::KwPrintInt => {
+            Token::KwReturn => {
                 self.bump();
-                self.consume(Token::LParen, "`(`")?;
-                let arg = self.parse_expr()?;
-                self.consume(Token::RParen, "`)`")?;
+                if matches!(self.peek(), Token::Semicolon) {
+                    self.bump();
+                    return Ok(Stmt::Return(None));
+                }
+                let e = self.parse_expr()?;
                 self.consume(Token::Semicolon, "`;`")?;
-                Ok(Stmt::PrintInt { arg })
-            }
-            Token::KwPrintBool => {
-                self.bump();
-                self.consume(Token::LParen, "`(`")?;
-                let arg = self.parse_expr()?;
-                self.consume(Token::RParen, "`)`")?;
-                self.consume(Token::Semicolon, "`;`")?;
-                Ok(Stmt::PrintBool { arg })
-            }
-            Token::KwPrintChar => {
-                self.bump();
-                self.consume(Token::LParen, "`(`")?;
-                let arg = self.parse_expr()?;
-                self.consume(Token::RParen, "`)`")?;
-                self.consume(Token::Semicolon, "`;`")?;
-                Ok(Stmt::PrintChar { arg })
-            }
-            Token::KwPrintString => {
-                self.bump();
-                self.consume(Token::LParen, "`(`")?;
-                let arg = self.parse_expr()?;
-                self.consume(Token::RParen, "`)`")?;
-                self.consume(Token::Semicolon, "`;`")?;
-                Ok(Stmt::PrintString { arg })
+                Ok(Stmt::Return(Some(e)))
             }
             Token::KwIf => {
                 self.bump();
@@ -182,7 +294,13 @@ impl<'a> Parser<'a> {
             Token::LBrace => Ok(Stmt::Block(self.parse_block()?)),
             Token::Ident(name) => {
                 self.bump();
-                if matches!(self.peek(), Token::LBracket) {
+                if matches!(self.peek(), Token::LParen) {
+                    self.bump();
+                    let args = self.parse_call_arg_list()?;
+                    self.consume(Token::RParen, "`)`")?;
+                    self.consume(Token::Semicolon, "`;`")?;
+                    Ok(Stmt::Expr(Expr::Call { name, args }))
+                } else if matches!(self.peek(), Token::LBracket) {
                     self.bump();
                     let index = self.parse_expr()?;
                     self.consume(Token::RBracket, "`]`")?;
@@ -197,9 +315,14 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// After `int` / `bool` / `char`: `name = expr`, `name [ N ]`, `name [] = { ... }`, or `char name [] = "..."`.
+    /// After `int` / `bool` / `char` in a statement: `name = expr`, `name [ N ]`, etc.
     fn parse_decl_tail_after_type(&mut self, elem: Ty) -> Result<Stmt, FrontEndError> {
         let name = self.expect_ident()?;
+        self.decl_tail_for_var(elem, name)
+    }
+
+    /// Same as [`Self::parse_decl_tail_after_type`] but **`name`** already consumed.
+    fn decl_tail_for_var(&mut self, elem: Ty, name: String) -> Result<Stmt, FrontEndError> {
         if matches!(self.peek(), Token::LBracket) {
             self.bump();
             if matches!(self.peek(), Token::RBracket) {
@@ -246,6 +369,35 @@ impl<'a> Parser<'a> {
             ty: elem,
             init,
         })
+    }
+
+    fn parse_call_arg_list(&mut self) -> Result<Vec<Expr>, FrontEndError> {
+        let mut args = Vec::new();
+        if matches!(self.peek(), Token::RParen) {
+            return Ok(args);
+        }
+        loop {
+            args.push(self.parse_expr()?);
+            match self.peek().clone() {
+                Token::Comma => {
+                    self.bump();
+                    if matches!(self.peek(), Token::RParen) {
+                        return Err(self
+                            .error("trailing `,` in argument list is not allowed")
+                            .into());
+                    }
+                }
+                Token::RParen => break,
+                other => {
+                    return Err(self
+                        .error(format!(
+                            "expected `,` or `)` in argument list, found `{other:?}`"
+                        ))
+                        .into());
+                }
+            }
+        }
+        Ok(args)
     }
 
     /// At least one expression; trailing comma allowed. Closing **`}`** not consumed before call; consumed here.
@@ -544,6 +696,24 @@ impl<'a> Parser<'a> {
     fn parse_postfix(&mut self) -> Result<Expr, FrontEndError> {
         let mut e = self.parse_primary()?;
         loop {
+            if matches!(self.peek(), Token::LParen) {
+                let callee = match e {
+                    Expr::Var(name) => name,
+                    _ => {
+                        return Err(self
+                            .error("call `f(...)` requires a plain function name")
+                            .into());
+                    }
+                };
+                self.bump();
+                let args = self.parse_call_arg_list()?;
+                self.consume(Token::RParen, "`)`")?;
+                e = Expr::Call {
+                    name: callee,
+                    args,
+                };
+                continue;
+            }
             if matches!(self.peek(), Token::LBracket) {
                 self.bump();
                 let ix = self.parse_expr()?;
@@ -652,32 +822,38 @@ impl<'a> Parser<'a> {
 #[cfg(test)]
 mod tests {
     use super::parse_program;
-    use crate::ast::{BinOp, Expr, Stmt, Ty};
+    use crate::ast::{BinOp, Expr, Item, Stmt, Ty};
 
     #[test]
     fn empty_program() {
         let p = parse_program("").unwrap();
-        assert!(p.stmts.is_empty());
+        assert!(p.items.is_empty());
     }
 
     #[test]
     fn decl_and_assign() {
         let p = parse_program("int x = 1; x = x + 2;").unwrap();
-        assert_eq!(p.stmts.len(), 2);
+        assert_eq!(p.items.len(), 2);
     }
 
     #[test]
     fn array_decl_and_index_expr() {
         let p = parse_program("int a[3]; a[1] = 42; print_int(a[1]);").unwrap();
-        assert!(matches!(&p.stmts[0], Stmt::ArrayDecl { len: 3, .. }));
-        assert!(matches!(&p.stmts[1], Stmt::IndexAssign { .. }));
+        assert!(matches!(&p.items[0], Item::Stmt(Stmt::ArrayDecl { len: 3, .. })));
+        assert!(matches!(&p.items[1], Item::Stmt(Stmt::IndexAssign { .. })));
+        assert!(matches!(
+            &p.items[2],
+            Item::Stmt(Stmt::Expr(Expr::Call { name, .. })) if name == "print_int"
+        ));
     }
 
     #[test]
     fn char_array_from_string_literal() {
         let p = parse_program(r#"char s[] = "hi";"#).unwrap();
-        match &p.stmts[0] {
-            Stmt::CharArrayFromString { bytes, .. } => assert_eq!(bytes, &[b'h', b'i', 0]),
+        match &p.items[0] {
+            Item::Stmt(Stmt::CharArrayFromString { bytes, .. }) => {
+                assert_eq!(bytes, &[b'h', b'i', 0])
+            }
             other => panic!("unexpected: {other:?}"),
         }
     }
@@ -688,14 +864,36 @@ mod tests {
     }
 
     #[test]
+    fn function_forward_and_def() {
+        let p = parse_program(
+            "int f(int x);\n\
+             int f(int x) { return x; }\n\
+             print_int(f(5));",
+        )
+        .unwrap();
+        assert!(matches!(&p.items[0], Item::FnDecl { .. }));
+        assert!(matches!(&p.items[1], Item::FnDef { .. }));
+        assert!(matches!(&p.items[2], Item::Stmt(_)));
+    }
+
+    #[test]
+    fn void_function_empty_params() {
+        let p = parse_program("void g() { return; }").unwrap();
+        let Item::FnDef { body, .. } = &p.items[0] else {
+            panic!("expected fn def");
+        };
+        assert!(matches!(body.as_slice(), [Stmt::Return(None)]));
+    }
+
+    #[test]
     fn int_array_literal_trailing_comma() {
         let p = parse_program("int arr[] = {1, 2, 3,};").unwrap();
-        match &p.stmts[0] {
-            Stmt::ArrayFromExprs {
+        match &p.items[0] {
+            Item::Stmt(Stmt::ArrayFromExprs {
                 elem_ty: Ty::Int,
                 elements,
                 ..
-            } => assert_eq!(elements.len(), 3),
+            }) => assert_eq!(elements.len(), 3),
             other => panic!("unexpected: {other:?}"),
         }
     }
@@ -703,12 +901,12 @@ mod tests {
     #[test]
     fn bool_array_literal() {
         let p = parse_program("bool f[] = { true, false };").unwrap();
-        match &p.stmts[0] {
-            Stmt::ArrayFromExprs {
+        match &p.items[0] {
+            Item::Stmt(Stmt::ArrayFromExprs {
                 elem_ty: Ty::Bool,
                 elements,
                 ..
-            } => assert_eq!(elements.len(), 2),
+            }) => assert_eq!(elements.len(), 2),
             other => panic!("unexpected: {other:?}"),
         }
     }
@@ -716,14 +914,14 @@ mod tests {
     #[test]
     fn post_inc_and_add_assign_stmts() {
         let p = parse_program("int i = 0; i++; i += 1;").unwrap();
-        assert!(matches!(&p.stmts[1], Stmt::PostInc { .. }));
-        assert!(matches!(&p.stmts[2], Stmt::AddAssign { .. }));
+        assert!(matches!(&p.items[1], Item::Stmt(Stmt::PostInc { .. })));
+        assert!(matches!(&p.items[2], Item::Stmt(Stmt::AddAssign { .. })));
     }
 
     #[test]
     fn post_inc_in_expr() {
         let p = parse_program("int i = 0; int j = i++;").unwrap();
-        let Stmt::VarDecl { init, .. } = &p.stmts[1] else {
+        let Item::Stmt(Stmt::VarDecl { init, .. }) = &p.items[1] else {
             panic!("expected var decl");
         };
         assert!(matches!(init, Expr::PostInc(_)));
@@ -732,13 +930,13 @@ mod tests {
     #[test]
     fn for_step_post_inc() {
         let p = parse_program("for (int i = 0; i < 2; i++) { }").unwrap();
-        assert!(matches!(&p.stmts[0], Stmt::For { step: Some(b), .. } if matches!(**b, Stmt::PostInc { .. })));
+        assert!(matches!(&p.items[0], Item::Stmt(Stmt::For { step: Some(b), .. }) if matches!(**b, Stmt::PostInc { .. })));
     }
 
     #[test]
     fn mul_binds_tighter_than_add() {
         let p = parse_program("int x = 1 + 2 * 3;").unwrap();
-        let Stmt::VarDecl { init, .. } = &p.stmts[0] else {
+        let Item::Stmt(Stmt::VarDecl { init, .. }) = &p.items[0] else {
             panic!("expected var decl");
         };
         assert_eq!(
@@ -758,14 +956,18 @@ mod tests {
     #[test]
     fn if_else_branch() {
         let p = parse_program("if (true) int x = 1; else { x = 2; }").unwrap();
-        assert!(matches!(&p.stmts[0], Stmt::If { else_branch: Some(_), .. }));
+        assert!(matches!(&p.items[0], Item::Stmt(Stmt::If { else_branch: Some(_), .. })));
     }
 
     #[test]
     fn bool_decl() {
         let p = parse_program("bool b = false;").unwrap();
-        match &p.stmts[0] {
-            Stmt::VarDecl { ty: Ty::Bool, init: Expr::BoolLit(false), .. } => {}
+        match &p.items[0] {
+            Item::Stmt(Stmt::VarDecl {
+                ty: Ty::Bool,
+                init: Expr::BoolLit(false),
+                ..
+            }) => {}
             other => panic!("unexpected: {other:?}"),
         }
     }
@@ -773,13 +975,13 @@ mod tests {
     #[test]
     fn line_comment_skipped() {
         let p = parse_program("// init\nint x = 0;").unwrap();
-        assert_eq!(p.stmts.len(), 1);
+        assert_eq!(p.items.len(), 1);
     }
 
     #[test]
     fn or_is_left_associative_in_ast_shape() {
         let p = parse_program("bool b = true || false || false;").unwrap();
-        let Stmt::VarDecl { init, .. } = &p.stmts[0] else {
+        let Item::Stmt(Stmt::VarDecl { init, .. }) = &p.items[0] else {
             panic!("expected var decl");
         };
         assert!(matches!(

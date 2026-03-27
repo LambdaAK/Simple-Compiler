@@ -1,4 +1,4 @@
-//! Three-address intermediate representation for a **single procedure** (e.g. `_main`).
+//! Three-address intermediate representation (**multi-procedure**: [`IrModule`]).
 //!
 //! - Each instruction is one step; results go into a [`Temp`] or named variables via [`Instr::LoadVar`] / [`Instr::StoreVar`].
 //! - AST **`bool`** lowers to an **`i64` word**: `0` or `1` (same representation as in registers).
@@ -26,8 +26,26 @@ impl IrProgram {
     }
 }
 
+/// One user function (**not** `_main`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct IrFunction {
+    /// Source name (codegen emits `_name` on macOS).
+    pub name: String,
+    pub instrs: Vec<Instr>,
+}
+
+/// `_main` plus user procedures.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct IrModule {
+    pub main: IrProgram,
+    pub functions: Vec<IrFunction>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Instr {
+    /// At function entry: copy incoming **AAPCS** argument register `x{0 + reg_idx}` into `slot`.
+    RecvParam(Temp, u8),
+
     /// `dst = imm`
     Const(Temp, i64),
 
@@ -71,6 +89,14 @@ pub enum Instr {
     /// `first_slot[index] = src`
     StoreIndex(String, Temp, Temp, usize),
 
+    // --- calls (`callee` is source name; codegen adds `_`) ---
+    /// User function call; **`dst`** absent for **void** callees.
+    Call {
+        dst: Option<Temp>,
+        callee: String,
+        args: Vec<Temp>,
+    },
+
     // --- host / libc I/O (lowering only; macOS uses `_printf`) ---
     /// Print one signed 64-bit line (`%lld\\n`).
     PrintInt(Temp),
@@ -88,4 +114,7 @@ pub enum Instr {
     Jump(String),
     /// If `cond == 0`, jump to `label` (useful for branching on lowered `bool`).
     JumpIfZero(Temp, String),
+
+    /// Return to caller; move **`src`** into **`x0`** when present.
+    Ret(Option<Temp>),
 }

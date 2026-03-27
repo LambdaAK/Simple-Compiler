@@ -1,4 +1,4 @@
-//! Emit **Apple macOS ARM64** assembly from [`crate::ir::IrProgram`].
+//! Emit **Apple macOS ARM64** assembly from [`crate::ir::IrModule`].
 //!
 //! Stack-only storage: every IR temp and variable slot gets an 8-byte word on the stack.
 //! `x29` is the frame pointer; locals sit below the saved `fp`/`lr` pair (`sub sp, sp, #N`).
@@ -6,52 +6,54 @@
 use std::collections::HashMap;
 use std::fmt::Write;
 
-use crate::ir::{Instr, IrProgram};
+use crate::ir::{Instr, IrModule};
 
-/// ARM64 assembly for a single `\_main` (text section, machO-style symbol).
-pub fn emit_arm64(ir: &IrProgram) -> String {
-    let needs_printf = ir.instrs.iter().any(|i| {
-        matches!(
-            i,
-            Instr::PrintInt(_)
-            | Instr::PrintBool(_)
-            | Instr::PrintChar(_)
-            | Instr::PrintCharOnly(_)
-            | Instr::PrintNl
-        )
-    });
+fn module_needs_printf(module: &IrModule) -> bool {
+    let check = |instrs: &[Instr]| {
+        instrs.iter().any(|i| {
+            matches!(
+                i,
+                Instr::PrintInt(_)
+                    | Instr::PrintBool(_)
+                    | Instr::PrintChar(_)
+                    | Instr::PrintCharOnly(_)
+                    | Instr::PrintNl
+            )
+        })
+    };
+    check(&module.main.instrs) || module.functions.iter().any(|f| check(&f.instrs))
+}
 
-    let slots = collect_slots(&ir.instrs);
-    let n = slots.len();
-    let locals = align16(n * 8);
-    let off: HashMap<&str, usize> = slots
-        .iter()
-        .enumerate()
-        .map(|(i, s)| (s.as_str(), i * 8))
-        .collect();
-
+/// ARM64 assembly: user functions then `_main` (mach-O style symbols with leading `_`).
+pub fn emit_arm64(module: &IrModule) -> String {
+    let needs_printf = module_needs_printf(module);
     let mut o = String::new();
 
     writeln!(o, "    .text").unwrap();
     if needs_printf {
         writeln!(o, "    .extern _printf").unwrap();
     }
-    writeln!(o, "    .globl _main").unwrap();
-    writeln!(o, "    .p2align 2").unwrap();
-    writeln!(o, "_main:").unwrap();
-    writeln!(o, "    stp x29, x30, [sp, #-16]!").unwrap();
-    writeln!(o, "    mov x29, sp").unwrap();
-    emit_sub_sp(&mut o, locals);
 
     let mut print_bool_id = 0usize;
-    for instr in &ir.instrs {
-        emit_instr(&mut o, instr, &off, needs_printf, &mut print_bool_id);
+    for f in &module.functions {
+        let sym = format!("_{}", f.name);
+        emit_procedure(
+            &mut o,
+            &sym,
+            &f.instrs,
+            needs_printf,
+            &mut print_bool_id,
+            false,
+        );
     }
-
-    writeln!(o, "    mov sp, x29").unwrap();
-    writeln!(o, "    mov x0, #0").unwrap();
-    writeln!(o, "    ldp x29, x30, [sp], #16").unwrap();
-    writeln!(o, "    ret").unwrap();
+    emit_procedure(
+        &mut o,
+        "_main",
+        &module.main.instrs,
+        needs_printf,
+        &mut print_bool_id,
+        true,
+    );
 
     if needs_printf {
         writeln!(o).unwrap();
@@ -71,6 +73,42 @@ pub fn emit_arm64(ir: &IrProgram) -> String {
     }
 
     o
+}
+
+fn emit_procedure(
+    o: &mut String,
+    symbol: &str,
+    instrs: &[Instr],
+    needs_printf: bool,
+    print_bool_id: &mut usize,
+    is_main: bool,
+) {
+    let slots = collect_slots(instrs);
+    let n = slots.len();
+    let locals = align16(n * 8);
+    let off: HashMap<&str, usize> = slots
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.as_str(), i * 8))
+        .collect();
+
+    writeln!(o, "    .globl {symbol}").unwrap();
+    writeln!(o, "    .p2align 2").unwrap();
+    writeln!(o, "{symbol}:").unwrap();
+    writeln!(o, "    stp x29, x30, [sp, #-16]!").unwrap();
+    writeln!(o, "    mov x29, sp").unwrap();
+    emit_sub_sp(o, locals);
+
+    for instr in instrs {
+        emit_instr(o, instr, &off, needs_printf, print_bool_id);
+    }
+
+    if is_main {
+        writeln!(o, "    mov sp, x29").unwrap();
+        writeln!(o, "    mov x0, #0").unwrap();
+        writeln!(o, "    ldp x29, x30, [sp], #16").unwrap();
+        writeln!(o, "    ret").unwrap();
+    }
 }
 
 fn align16(n: usize) -> usize {
@@ -101,6 +139,7 @@ fn collect_slots(instrs: &[Instr]) -> Vec<String> {
 
     for instr in instrs {
         match instr {
+            Instr::RecvParam(d, _) => note(d),
             Instr::Const(d, _) => note(d),
             Instr::Add(d, a, b) | Instr::Sub(d, a, b) | Instr::Mul(d, a, b) | Instr::Div(d, a, b) => {
                 note(d);
@@ -143,11 +182,21 @@ fn collect_slots(instrs: &[Instr]) -> Vec<String> {
                 note(src);
             }
             Instr::JumpIfZero(c, _) => note(c),
+            Instr::Call { dst, args, .. } => {
+                if let Some(d) = dst {
+                    note(d);
+                }
+                for a in args {
+                    note(a);
+                }
+            }
             Instr::PrintInt(t) | Instr::PrintBool(t) | Instr::PrintChar(t) | Instr::PrintCharOnly(t) => {
                 note(t);
             }
             Instr::PrintNl => {}
             Instr::Label(_) | Instr::Jump(_) => {}
+            Instr::Ret(Some(t)) => note(t),
+            Instr::Ret(None) => {}
         }
     }
     order
@@ -209,6 +258,10 @@ fn emit_instr(
     let oa = |name: &str| *off.get(name).expect("slot in layout");
 
     match instr {
+        Instr::RecvParam(slot, reg_idx) => {
+            let reg = ["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"][*reg_idx as usize];
+            str_stack(o, reg, oa(slot));
+        }
         Instr::Const(dst, imm) => {
             mov_i64(o, "x8", *imm);
             str_stack(o, "x8", oa(dst));
@@ -370,6 +423,29 @@ fn emit_instr(
             writeln!(o, "    bl _printf").unwrap();
             writeln!(o, "    add sp, sp, #32").unwrap();
         }
+        Instr::Call {
+            dst,
+            callee,
+            args,
+        } => {
+            const ARGREG: [&str; 8] = ["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"];
+            for (i, a) in args.iter().enumerate() {
+                assert!(i < 8, "at most 8 arguments");
+                ldr_stack(o, ARGREG[i], oa(a));
+            }
+            writeln!(o, "    bl _{}", callee).unwrap();
+            if let Some(d) = dst {
+                str_stack(o, "x0", oa(d));
+            }
+        }
+        Instr::Ret(src) => {
+            if let Some(t) = src {
+                ldr_stack(o, "x0", oa(t));
+            }
+            writeln!(o, "    mov sp, x29").unwrap();
+            writeln!(o, "    ldp x29, x30, [sp], #16").unwrap();
+            writeln!(o, "    ret").unwrap();
+        }
     }
 }
 
@@ -392,14 +468,18 @@ fn cmp_cset(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::IrProgram;
+    use crate::ir::{IrModule, IrProgram};
 
     #[test]
     fn emit_main_has_globl_and_ret() {
-        let mut ir = IrProgram::new();
-        ir.push(Instr::Const("t0".into(), 5));
-        ir.push(Instr::StoreVar("v0".into(), "t0".into()));
-        let asm = emit_arm64(&ir);
+        let mut main = IrProgram::new();
+        main.push(Instr::Const("t0".into(), 5));
+        main.push(Instr::StoreVar("v0".into(), "t0".into()));
+        let module = IrModule {
+            main,
+            functions: vec![],
+        };
+        let asm = emit_arm64(&module);
         assert!(asm.contains(".globl _main"));
         assert!(asm.contains("_main:"));
         assert!(asm.contains("ret"));

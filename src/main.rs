@@ -1,4 +1,4 @@
-//! CLI: `compiler <path-to-source>` — parse, lower to IR, emit ARM64 `output.s` in cwd.
+//! CLI: `compiler <path-to-source>` — parse, lower to an `IrModule`, emit ARM64 `output.s` in cwd.
 
 use std::env;
 use std::fs;

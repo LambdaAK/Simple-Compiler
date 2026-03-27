@@ -1,14 +1,35 @@
-//! Lower [`crate::ast::Program`] to [`crate::ir::IrProgram`] (three-address code, one procedure).
+//! Lower [`crate::ast::Program`] to [`crate::ir::IrModule`] (three-address code, `_main` + user functions).
 
 use std::collections::HashMap;
 
-use crate::ast::{BinOp, Expr, Program, Stmt, Ty, UnaryOp};
-use crate::ir::{Instr, IrProgram};
+use crate::ast::{BinOp, Expr, Item, Program, RetTy, Stmt, Ty, UnaryOp};
+use crate::ir::{Instr, IrFunction, IrModule, IrProgram};
+
+const MAX_FUNC_PARAMS: usize = 8;
+
+/// `print_*` and user functions share this name list for resolution.
+pub const BUILTIN_PRINT_INT: &str = "print_int";
+pub const BUILTIN_PRINT_BOOL: &str = "print_bool";
+pub const BUILTIN_PRINT_CHAR: &str = "print_char";
+pub const BUILTIN_PRINT_STRING: &str = "print_string";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FnSig {
+    pub params: Vec<Ty>,
+    pub ret: RetTy,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LowerError {
     UndefinedVariable(String),
     TypeMismatch(String),
+    DuplicateFunction(String),
+    ConflictingPrototype(String),
+    UndefinedFunction(String),
+    ForwardDeclWithoutDefinition(String),
+    ReturnOutsideFunction,
+    BadReturn(String),
+    ParameterShadowsFunction(String),
 }
 
 #[derive(Debug, Clone)]
@@ -22,38 +43,107 @@ enum Binding {
     },
 }
 
-struct LowerCtx {
+struct LowerCtx<'a> {
     ir: IrProgram,
     scopes: Vec<HashMap<String, Binding>>,
     temp_id: usize,
     label_id: usize,
     slot_id: usize,
+    fn_sigs: &'a HashMap<String, FnSig>,
+    /// Prefix so labels are unique across functions (`main`, user name).
+    label_prefix: String,
+    /// `None` while lowering top-level script (`return` forbidden).
+    current_ret: Option<RetTy>,
 }
 
-impl LowerCtx {
-    fn new() -> Self {
+impl<'a> LowerCtx<'a> {
+    fn new_main(fn_sigs: &'a HashMap<String, FnSig>) -> Self {
         Self {
             ir: IrProgram::new(),
             scopes: vec![HashMap::new()],
             temp_id: 0,
             label_id: 0,
             slot_id: 0,
+            fn_sigs,
+            label_prefix: "main".into(),
+            current_ret: None,
         }
     }
 
+    fn new_function(
+        fn_sigs: &'a HashMap<String, FnSig>,
+        name: &str,
+        ret: RetTy,
+        params: &[(String, Ty)],
+    ) -> Self {
+        let n = params.len();
+        let mut cx = Self {
+            ir: IrProgram::new(),
+            scopes: vec![HashMap::new()],
+            temp_id: 0,
+            label_id: 0,
+            slot_id: n,
+            fn_sigs,
+            label_prefix: name.to_string(),
+            current_ret: Some(ret),
+        };
+        for (i, (pname, ty)) in params.iter().enumerate() {
+            let slot = format!("v{}", i);
+            cx.scopes
+                .last_mut()
+                .expect("lower: root scope")
+                .insert(
+                    pname.clone(),
+                    Binding::Scalar {
+                        slot: slot.clone(),
+                        ty: *ty,
+                    },
+                );
+            cx.ir.push(Instr::RecvParam(
+                slot,
+                u8::try_from(i).expect("parameter count checked at build_fn_table"),
+            ));
+        }
+        cx
+    }
+
+    fn finish_function(&mut self, ret: RetTy) -> Result<(), LowerError> {
+        let ends_with_ret = self
+            .ir
+            .instrs
+            .last()
+            .is_some_and(|i| matches!(i, Instr::Ret(_)));
+        if ends_with_ret {
+            return Ok(());
+        }
+        match ret {
+            RetTy::Void => self.ir.push(Instr::Ret(None)),
+            RetTy::Scalar(_) => {
+                return Err(LowerError::TypeMismatch(format!(
+                    "function `{}` may fall off without returning a value",
+                    self.label_prefix
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn fresh_temp(&mut self) -> String {
-        let t = format!("t{}", self.temp_id);
+        let t = format!("{}_t{}", self.label_prefix, self.temp_id);
         self.temp_id += 1;
         t
     }
 
     fn fresh_label(&mut self, prefix: &str) -> String {
-        let l = format!("{}.{}", prefix, self.label_id);
+        let l = format!("{}.{}.{}", self.label_prefix, prefix, self.label_id);
         self.label_id += 1;
         l
     }
 
-    fn declare(&mut self, source_name: &str, ty: Ty) -> String {
+    fn declare(&mut self, source_name: &str, ty: Ty) -> Result<String, LowerError> {
+        if self.fn_sigs.contains_key(source_name) {
+            return Err(LowerError::ParameterShadowsFunction(source_name.to_string()));
+        }
         let slot = format!("v{}", self.slot_id);
         self.slot_id += 1;
         self.scopes
@@ -66,10 +156,13 @@ impl LowerCtx {
                     ty,
                 },
             );
-        slot
+        Ok(slot)
     }
 
-    fn declare_array(&mut self, source_name: &str, elem: Ty, len: usize) {
+    fn declare_array(&mut self, source_name: &str, elem: Ty, len: usize) -> Result<(), LowerError> {
+        if self.fn_sigs.contains_key(source_name) {
+            return Err(LowerError::ParameterShadowsFunction(source_name.to_string()));
+        }
         let start = self.slot_id;
         self.slot_id += len;
         let first_slot = format!("v{}", start);
@@ -88,10 +181,18 @@ impl LowerCtx {
             let slot = format!("v{}", start + i);
             self.ir.push(Instr::StoreVarImm(slot, 0));
         }
+        Ok(())
     }
 
     /// `char s[] = "...";` — **bytes** includes the trailing **`0`** (NUL).
-    fn declare_char_array_from_bytes(&mut self, source_name: &str, bytes: &[u8]) {
+    fn declare_char_array_from_bytes(
+        &mut self,
+        source_name: &str,
+        bytes: &[u8],
+    ) -> Result<(), LowerError> {
+        if self.fn_sigs.contains_key(source_name) {
+            return Err(LowerError::ParameterShadowsFunction(source_name.to_string()));
+        }
         let len = bytes.len();
         let start = self.slot_id;
         self.slot_id += len;
@@ -112,6 +213,7 @@ impl LowerCtx {
                 .ir
                 .push(Instr::StoreVarImm(format!("v{}", start + i), i64::from(*b)));
         }
+        Ok(())
     }
 
     /// Anonymous NUL-terminated bytes on the stack (for string literals). Returns first slot id.
@@ -198,6 +300,16 @@ impl LowerCtx {
         Ok(())
     }
 
+    fn is_builtin(name: &str) -> bool {
+        matches!(
+            name,
+            BUILTIN_PRINT_INT
+                | BUILTIN_PRINT_BOOL
+                | BUILTIN_PRINT_CHAR
+                | BUILTIN_PRINT_STRING
+        )
+    }
+
     fn check_array_literal_elem(&self, elem_ty: Ty, e: &Expr) -> Result<(), LowerError> {
         match elem_ty {
             Ty::Bool => {
@@ -281,6 +393,34 @@ impl LowerCtx {
                 Self::expect_ty(self.expr_ty(e)?, Ty::Bool, "unary `!` expects bool operand")?;
                 Ok(Ty::Bool)
             }
+            Expr::Call { name, args } => {
+                if Self::is_builtin(name) {
+                    return Err(LowerError::TypeMismatch(format!(
+                        "builtin `{name}` does not produce a value"
+                    )));
+                }
+                let sig = self
+                    .fn_sigs
+                    .get(name)
+                    .ok_or_else(|| LowerError::UndefinedFunction(name.clone()))?;
+                if args.len() != sig.params.len() {
+                    return Err(LowerError::TypeMismatch(format!(
+                        "function `{name}` expects {} arguments, got {}",
+                        sig.params.len(),
+                        args.len()
+                    )));
+                }
+                for (a, &pty) in args.iter().zip(&sig.params) {
+                    let at = self.expr_ty(a)?;
+                    Self::expect_ty(at, pty, &format!("argument to `{name}`"))?;
+                }
+                match sig.ret {
+                    RetTy::Void => Err(LowerError::TypeMismatch(format!(
+                        "function `{name}` returns void and cannot be used as an expression"
+                    ))),
+                    RetTy::Scalar(t) => Ok(t),
+                }
+            }
             Expr::Binary(op, l, r) => {
                 let lt = self.expr_ty(l)?;
                 let rt = self.expr_ty(r)?;
@@ -363,6 +503,12 @@ impl LowerCtx {
                 };
                 self.ir.push(instr);
                 Ok(dst)
+            }
+            Expr::Call { name, args } => {
+                let v = self.lower_call(name, args, true)?;
+                v.ok_or_else(|| {
+                    LowerError::TypeMismatch(format!("void function `{name}` has no value"))
+                })
             }
             Expr::Binary(op, l, r) => {
                 let a = self.lower_expr(l)?;
@@ -467,6 +613,153 @@ impl LowerCtx {
         }
     }
 
+    fn lower_builtin_call(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        need_value: bool,
+    ) -> Result<Option<String>, LowerError> {
+        if need_value {
+            return Err(LowerError::TypeMismatch(format!(
+                "builtin `{name}` does not return a value"
+            )));
+        }
+        match name {
+            BUILTIN_PRINT_INT => {
+                if args.len() != 1 {
+                    return Err(LowerError::TypeMismatch(format!(
+                        "`print_int` expects 1 argument, got {}",
+                        args.len()
+                    )));
+                }
+                Self::expect_ty(self.expr_ty(&args[0])?, Ty::Int, "`print_int` argument")?;
+                let tmp = self.lower_expr(&args[0])?;
+                self.ir.push(Instr::PrintInt(tmp));
+            }
+            BUILTIN_PRINT_BOOL => {
+                if args.len() != 1 {
+                    return Err(LowerError::TypeMismatch(format!(
+                        "`print_bool` expects 1 argument, got {}",
+                        args.len()
+                    )));
+                }
+                Self::expect_ty(self.expr_ty(&args[0])?, Ty::Bool, "`print_bool` argument")?;
+                let tmp = self.lower_expr(&args[0])?;
+                self.ir.push(Instr::PrintBool(tmp));
+            }
+            BUILTIN_PRINT_CHAR => {
+                if args.len() != 1 {
+                    return Err(LowerError::TypeMismatch(format!(
+                        "`print_char` expects 1 argument, got {}",
+                        args.len()
+                    )));
+                }
+                Self::expect_ty(self.expr_ty(&args[0])?, Ty::Char, "`print_char` argument")?;
+                let tmp = self.lower_expr(&args[0])?;
+                self.ir.push(Instr::PrintChar(tmp));
+            }
+            BUILTIN_PRINT_STRING => {
+                if args.len() != 1 {
+                    return Err(LowerError::TypeMismatch(format!(
+                        "`print_string` expects 1 argument, got {}",
+                        args.len()
+                    )));
+                }
+                let (first_slot, len) = match &args[0] {
+                    Expr::StringLit(raw) => {
+                        let mut v = raw.clone();
+                        v.push(0);
+                        let first = self.emit_stack_c_string(&v);
+                        (first, v.len())
+                    }
+                    Expr::Var(aname) => {
+                        let (first, elem, len) = self.resolve_array(aname)?;
+                        if elem != Ty::Char {
+                            return Err(LowerError::TypeMismatch(
+                                "`print_string` expects `char[]`, got non-char array".into(),
+                            ));
+                        }
+                        (first, len)
+                    }
+                    _ => {
+                        return Err(LowerError::TypeMismatch(
+                            "`print_string` expects `\"...\"` or a `char[]` variable".into(),
+                        ));
+                    }
+                };
+                self.lower_print_string_chars(&first_slot, len);
+            }
+            _ => {
+                return Err(LowerError::TypeMismatch(format!(
+                    "unknown builtin `{name}`"
+                )));
+            }
+        }
+        Ok(None)
+    }
+
+    fn lower_user_call(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        need_value: bool,
+    ) -> Result<Option<String>, LowerError> {
+        let sig = self
+            .fn_sigs
+            .get(name)
+            .ok_or_else(|| LowerError::UndefinedFunction(name.to_string()))?;
+        if args.len() != sig.params.len() {
+            return Err(LowerError::TypeMismatch(format!(
+                "function `{name}` expects {} arguments, got {}",
+                sig.params.len(),
+                args.len()
+            )));
+        }
+        for (a, &pty) in args.iter().zip(&sig.params) {
+            let at = self.expr_ty(a)?;
+            Self::expect_ty(at, pty, &format!("argument to `{name}`"))?;
+        }
+        let arg_temps: Result<Vec<_>, _> = args.iter().map(|a| self.lower_expr(a)).collect();
+        let arg_temps = arg_temps?;
+        match sig.ret {
+            RetTy::Void => {
+                if need_value {
+                    return Err(LowerError::TypeMismatch(format!(
+                        "function `{name}` returns void"
+                    )));
+                }
+                self.ir.push(Instr::Call {
+                    dst: None,
+                    callee: name.to_string(),
+                    args: arg_temps,
+                });
+                Ok(None)
+            }
+            RetTy::Scalar(_) => {
+                let d = self.fresh_temp();
+                self.ir.push(Instr::Call {
+                    dst: Some(d.clone()),
+                    callee: name.to_string(),
+                    args: arg_temps,
+                });
+                Ok(Some(d))
+            }
+        }
+    }
+
+    fn lower_call(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        need_value: bool,
+    ) -> Result<Option<String>, LowerError> {
+        if Self::is_builtin(name) {
+            self.lower_builtin_call(name, args, need_value)
+        } else {
+            self.lower_user_call(name, args, need_value)
+        }
+    }
+
     fn lower_stmt(&mut self, stmt: &Stmt) -> Result<(), LowerError> {
         match stmt {
             Stmt::VarDecl { name, ty, init } => {
@@ -484,21 +777,24 @@ impl LowerCtx {
                         Self::expect_ty(init_ty, *ty, "variable initializer vs declared type")?;
                     }
                 }
-                let slot = self.declare(name, *ty);
+                let slot = self.declare(name, *ty)?;
                 let tmp = self.lower_expr(init)?;
                 self.ir.push(Instr::StoreVar(slot, tmp));
             }
             Stmt::ArrayDecl { name, elem_ty, len } => {
-                self.declare_array(name, *elem_ty, *len);
+                self.declare_array(name, *elem_ty, *len)?;
             }
             Stmt::CharArrayFromString { name, bytes } => {
-                self.declare_char_array_from_bytes(name, bytes);
+                self.declare_char_array_from_bytes(name, bytes)?;
             }
             Stmt::ArrayFromExprs {
                 name,
                 elem_ty,
                 elements,
             } => {
+                if self.fn_sigs.contains_key(name) {
+                    return Err(LowerError::ParameterShadowsFunction(name.clone()));
+                }
                 if elements.is_empty() {
                     return Err(LowerError::TypeMismatch(
                         "array initializer list must not be empty".into(),
@@ -612,45 +908,50 @@ impl LowerCtx {
             Stmt::PostInc { name } => {
                 self.lower_post_inc(name)?;
             }
-            Stmt::PrintInt { arg } => {
-                Self::expect_ty(self.expr_ty(arg)?, Ty::Int, "`print_int` argument")?;
-                let tmp = self.lower_expr(arg)?;
-                self.ir.push(Instr::PrintInt(tmp));
+            Stmt::Expr(Expr::Call { name, args }) => {
+                if Self::is_builtin(name) {
+                    self.lower_builtin_call(name, args, false)?;
+                    return Ok(());
+                }
+                let sig = self
+                    .fn_sigs
+                    .get(name)
+                    .ok_or_else(|| LowerError::UndefinedFunction(name.clone()))?;
+                if sig.ret != RetTy::Void {
+                    return Err(LowerError::TypeMismatch(format!(
+                        "non-void function `{name}` cannot be used as an expression statement"
+                    )));
+                }
+                self.lower_user_call(name, args, false)?;
             }
-            Stmt::PrintBool { arg } => {
-                Self::expect_ty(self.expr_ty(arg)?, Ty::Bool, "`print_bool` argument")?;
-                let tmp = self.lower_expr(arg)?;
-                self.ir.push(Instr::PrintBool(tmp));
+            Stmt::Expr(_) => {
+                return Err(LowerError::TypeMismatch(
+                    "expression statement must be a void function call".into(),
+                ));
             }
-            Stmt::PrintChar { arg } => {
-                Self::expect_ty(self.expr_ty(arg)?, Ty::Char, "`print_char` argument")?;
-                let tmp = self.lower_expr(arg)?;
-                self.ir.push(Instr::PrintChar(tmp));
-            }
-            Stmt::PrintString { arg } => {
-                let (first_slot, len) = match arg {
-                    Expr::StringLit(raw) => {
-                        let mut v = raw.clone();
-                        v.push(0);
-                        let first = self.emit_stack_c_string(&v);
-                        (first, v.len())
+            Stmt::Return(opt) => {
+                let ret_ty = self.current_ret.ok_or(LowerError::ReturnOutsideFunction)?;
+                match (ret_ty, opt) {
+                    (RetTy::Void, None) => {
+                        self.ir.push(Instr::Ret(None));
                     }
-                    Expr::Var(name) => {
-                        let (first, elem, len) = self.resolve_array(name)?;
-                        if elem != Ty::Char {
-                            return Err(LowerError::TypeMismatch(
-                                "`print_string` expects `char[]`, got non-char array".into(),
-                            ));
-                        }
-                        (first, len)
-                    }
-                    _ => {
-                        return Err(LowerError::TypeMismatch(
-                            "`print_string` expects `\"...\"` or a `char[]` variable".into(),
+                    (RetTy::Void, Some(_)) => {
+                        return Err(LowerError::BadReturn(
+                            "void function must use `return;` without a value".into(),
                         ));
                     }
-                };
-                self.lower_print_string_chars(&first_slot, len);
+                    (RetTy::Scalar(_), None) => {
+                        return Err(LowerError::BadReturn(
+                            "non-void function must return a value".into(),
+                        ));
+                    }
+                    (RetTy::Scalar(want), Some(e)) => {
+                        let got = self.expr_ty(e)?;
+                        Self::expect_ty(got, want, "`return` value vs function return type")?;
+                        let t = self.lower_expr(e)?;
+                        self.ir.push(Instr::Ret(Some(t)));
+                    }
+                }
             }
             Stmt::Block(stmts) => {
                 self.push_scope();
@@ -735,19 +1036,103 @@ impl LowerCtx {
     }
 }
 
-/// Lower a full program to linear IR for one procedure.
-pub fn lower_program(program: &Program) -> Result<IrProgram, LowerError> {
-    let mut cx = LowerCtx::new();
-    for stmt in &program.stmts {
-        cx.lower_stmt(stmt)?;
+fn fn_sig_from_ast(params: &[(String, Ty)], ret: RetTy) -> FnSig {
+    FnSig {
+        params: params.iter().map(|(_, t)| *t).collect(),
+        ret,
     }
-    Ok(cx.ir)
+}
+
+/// Build the user function table (each forward declaration must match its definition).
+pub fn build_fn_table(program: &Program) -> Result<HashMap<String, FnSig>, LowerError> {
+    let mut protos: HashMap<String, FnSig> = HashMap::new();
+    let mut defs: HashMap<String, FnSig> = HashMap::new();
+
+    for item in &program.items {
+        match item {
+            Item::FnDecl { name, params, ret } => {
+                if params.len() > MAX_FUNC_PARAMS {
+                    return Err(LowerError::TypeMismatch(format!(
+                        "function `{name}`: at most {MAX_FUNC_PARAMS} parameters supported"
+                    )));
+                }
+                let sig = fn_sig_from_ast(params, *ret);
+                if let Some(old) = protos.get(name) {
+                    if old != &sig {
+                        return Err(LowerError::ConflictingPrototype(name.clone()));
+                    }
+                } else {
+                    protos.insert(name.clone(), sig);
+                }
+            }
+            Item::FnDef { name, params, ret, .. } => {
+                if params.len() > MAX_FUNC_PARAMS {
+                    return Err(LowerError::TypeMismatch(format!(
+                        "function `{name}`: at most {MAX_FUNC_PARAMS} parameters supported"
+                    )));
+                }
+                let sig = fn_sig_from_ast(params, *ret);
+                if let Some(p) = protos.get(name) {
+                    if p != &sig {
+                        return Err(LowerError::ConflictingPrototype(name.clone()));
+                    }
+                }
+                if defs.insert(name.clone(), sig).is_some() {
+                    return Err(LowerError::DuplicateFunction(name.clone()));
+                }
+            }
+            Item::Stmt(_) => {}
+        }
+    }
+
+    for name in protos.keys() {
+        if !defs.contains_key(name) {
+            return Err(LowerError::ForwardDeclWithoutDefinition(name.clone()));
+        }
+    }
+
+    Ok(defs)
+}
+
+/// Lower a full program to an [`IrModule`] (`_main` plus user functions).
+pub fn lower_program(program: &Program) -> Result<IrModule, LowerError> {
+    let fn_table = build_fn_table(program)?;
+    let mut main_cx = LowerCtx::new_main(&fn_table);
+    let mut functions = Vec::new();
+
+    for item in &program.items {
+        match item {
+            Item::Stmt(stmt) => main_cx.lower_stmt(stmt)?,
+            Item::FnDecl { .. } => {}
+            Item::FnDef {
+                name,
+                params,
+                ret,
+                body,
+            } => {
+                let mut cx = LowerCtx::new_function(&fn_table, name, *ret, params);
+                for st in body {
+                    cx.lower_stmt(st)?;
+                }
+                cx.finish_function(*ret)?;
+                functions.push(IrFunction {
+                    name: name.clone(),
+                    instrs: cx.ir.instrs,
+                });
+            }
+        }
+    }
+
+    Ok(IrModule {
+        main: main_cx.ir,
+        functions,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::{Expr, Stmt, Ty};
+    use crate::ast::{Expr, Item, Program, Stmt, Ty};
     use crate::parser::parse_program;
 
     #[test]
@@ -755,11 +1140,12 @@ mod tests {
         let p = parse_program("int x = 1 + 2;").unwrap();
         let ir = lower_program(&p).unwrap();
         assert!(
-            ir.instrs.iter().any(|i| matches!(i, Instr::Add(_, _, _))),
+            ir.main.instrs.iter().any(|i| matches!(i, Instr::Add(_, _, _))),
             "{ir:?}"
         );
         assert!(
-            ir.instrs
+            ir.main
+                .instrs
                 .iter()
                 .any(|i| matches!(i, Instr::StoreVar(s, _) if s.starts_with('v'))),
             "{ir:?}"
@@ -779,10 +1165,11 @@ mod tests {
     fn if_else_labels() {
         let p = parse_program("bool b = true; if (b) { int x = 1; } else { int x = 2; }").unwrap();
         let ir = lower_program(&p).unwrap();
-        assert!(ir.instrs.iter().any(|i| matches!(i, Instr::JumpIfZero(_, _))));
-        assert!(ir.instrs.iter().any(|i| matches!(i, Instr::Jump(_))));
+        assert!(ir.main.instrs.iter().any(|i| matches!(i, Instr::JumpIfZero(_, _))));
+        assert!(ir.main.instrs.iter().any(|i| matches!(i, Instr::Jump(_))));
         assert!(
-            ir.instrs
+            ir.main
+                .instrs
                 .iter()
                 .filter(|i| matches!(i, Instr::Label(_)))
                 .count()
@@ -793,14 +1180,14 @@ mod tests {
     #[test]
     fn bool_lowers_to_zero_one() {
         let p = Program {
-            stmts: vec![Stmt::VarDecl {
+            items: vec![Item::Stmt(Stmt::VarDecl {
                 name: "b".into(),
                 ty: Ty::Bool,
                 init: Expr::BoolLit(false),
-            }],
+            })],
         };
         let ir = lower_program(&p).unwrap();
-        assert!(ir.instrs.iter().any(|i| matches!(i, Instr::Const(_, 0))));
+        assert!(ir.main.instrs.iter().any(|i| matches!(i, Instr::Const(_, 0))));
     }
 
     #[test]
@@ -808,10 +1195,10 @@ mod tests {
         let p = parse_program("print_int(42);").unwrap();
         let ir = lower_program(&p).unwrap();
         assert!(ir
+            .main
             .instrs
             .iter()
-            .any(|i| matches!(i, Instr::PrintInt(t) if t.starts_with('t')))
-            );
+            .any(|i| matches!(i, Instr::PrintInt(_))));
     }
 
     #[test]
@@ -827,17 +1214,18 @@ mod tests {
     fn char_literal_print_and_int_init() {
         let p = parse_program("char c = 'A'; print_char(c); char d = 66; print_char(d);").unwrap();
         let ir = lower_program(&p).unwrap();
-        assert!(ir.instrs.iter().filter(|i| matches!(i, Instr::PrintChar(_))).count() >= 2);
+        assert!(ir.main.instrs.iter().filter(|i| matches!(i, Instr::PrintChar(_))).count() >= 2);
     }
 
     #[test]
     fn while_loop_jump_pattern() {
         let p = parse_program("int i = 0; while (i < 3) { i = i + 1; }").unwrap();
         let ir = lower_program(&p).unwrap();
-        let jumps = ir.instrs.iter().filter(|i| matches!(i, Instr::Jump(_))).count();
+        let jumps = ir.main.instrs.iter().filter(|i| matches!(i, Instr::Jump(_))).count();
         assert!(jumps >= 1, "{ir:?}");
         assert!(
-            ir.instrs
+            ir.main
+                .instrs
                 .iter()
                 .any(|i| matches!(i, Instr::Label(l) if l.contains("while"))),
             "{ir:?}"
@@ -849,7 +1237,8 @@ mod tests {
         let p = parse_program("for (int i = 0; i < 3; i = i + 1) { print_int(i); }").unwrap();
         let ir = lower_program(&p).unwrap();
         assert!(
-            ir.instrs
+            ir.main
+                .instrs
                 .iter()
                 .any(|i| matches!(i, Instr::Label(l) if l.contains("for_head"))),
             "{ir:?}"
@@ -861,6 +1250,7 @@ mod tests {
         let p = parse_program("int i = 0; i++; i += 2; print_int(i);").unwrap();
         let ir = lower_program(&p).unwrap();
         let adds = ir
+            .main
             .instrs
             .iter()
             .filter(|i| matches!(i, Instr::Add(_, _, _)))
@@ -873,7 +1263,8 @@ mod tests {
         let p = parse_program("int i = 0; print_int(i++); print_int(i);").unwrap();
         let ir = lower_program(&p).unwrap();
         assert!(
-            ir.instrs
+            ir.main
+                .instrs
                 .iter()
                 .filter(|i| matches!(i, Instr::PrintInt(_)))
                 .count()
@@ -887,13 +1278,15 @@ mod tests {
         let p = parse_program("int a[3]; a[1] = 42; print_int(a[1]);").unwrap();
         let ir = lower_program(&p).unwrap();
         assert!(
-            ir.instrs
+            ir.main
+                .instrs
                 .iter()
                 .any(|i| matches!(i, Instr::LoadIndex(_, _, _, _))),
             "{ir:?}"
         );
         assert!(
-            ir.instrs
+            ir.main
+                .instrs
                 .iter()
                 .any(|i| matches!(i, Instr::StoreIndex(_, _, _, _))),
             "{ir:?}"
@@ -901,15 +1294,36 @@ mod tests {
     }
 
     #[test]
+    fn user_function_call_in_main() {
+        let p = parse_program("int f() { return 7; } print_int(f());").unwrap();
+        let m = lower_program(&p).unwrap();
+        assert_eq!(m.functions.len(), 1);
+        assert!(m.functions[0].name == "f");
+        assert!(m
+            .main
+            .instrs
+            .iter()
+            .any(|i| matches!(i, Instr::Call { callee, .. } if callee == "f")));
+        assert!(m.functions[0]
+            .instrs
+            .iter()
+            .any(|i| matches!(i, Instr::Ret(Some(_)))));
+    }
+
+    #[test]
     fn print_string_uses_char_loop() {
         let p = parse_program(r#"print_string("ab");"#).unwrap();
         let ir = lower_program(&p).unwrap();
         assert!(
-            ir.instrs
+            ir.main
+                .instrs
                 .iter()
                 .any(|i| matches!(i, Instr::PrintCharOnly(_))),
             "{ir:?}"
         );
-        assert!(ir.instrs.iter().any(|i| matches!(i, Instr::PrintNl)), "{ir:?}");
+        assert!(
+            ir.main.instrs.iter().any(|i| matches!(i, Instr::PrintNl)),
+            "{ir:?}"
+        );
     }
 }
