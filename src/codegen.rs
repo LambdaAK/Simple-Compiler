@@ -37,9 +37,7 @@ pub fn emit_arm64(ir: &IrProgram) -> String {
     writeln!(o, "_main:").unwrap();
     writeln!(o, "    stp x29, x30, [sp, #-16]!").unwrap();
     writeln!(o, "    mov x29, sp").unwrap();
-    if locals > 0 {
-        writeln!(o, "    sub sp, sp, #{}", locals).unwrap();
-    }
+    emit_sub_sp(&mut o, locals);
 
     let mut print_bool_id = 0usize;
     for instr in &ir.instrs {
@@ -69,6 +67,16 @@ pub fn emit_arm64(ir: &IrProgram) -> String {
 
 fn align16(n: usize) -> usize {
     (n + 15) & !15
+}
+
+/// `sub sp, sp, #N` for the whole locals allocation. Each immediate must fit in 12 bits (0–4095).
+fn emit_sub_sp(o: &mut String, mut total: usize) {
+    const MAX_IMM: usize = 4095;
+    while total > 0 {
+        let chunk = total.min(MAX_IMM);
+        writeln!(o, "    sub sp, sp, #{}", chunk).unwrap();
+        total -= chunk;
+    }
 }
 
 /// Deterministic slot order: first time a name appears in a full IR walk.
