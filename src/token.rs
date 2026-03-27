@@ -1,5 +1,3 @@
-#![allow(dead_code)] // Emitted by the lexer once implemented.
-
 //! Lexical tokens for the C-shaped surface syntax (`int` / `bool`, statements, expressions).
 
 #[derive(Debug, Clone, PartialEq, Eq)]

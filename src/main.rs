@@ -1,5 +1,3 @@
-mod ast;
-mod ir;
-mod token;
+//! Binary entry point; use the `compiler` library crate for the frontend.
 
 fn main() {}
