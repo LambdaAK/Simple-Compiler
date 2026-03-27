@@ -7,6 +7,7 @@ pub enum Token {
     KwBool,
     KwIf,
     KwWhile,
+    KwFor,
     KwElse,
     KwTrue,
     KwFalse,
@@ -24,6 +25,10 @@ pub enum Token {
     // --- operators ---
     /// `+`
     Plus,
+    /// `++`
+    PlusPlus,
+    /// `+=`
+    PlusAssign,
     /// `-` (subtraction or unary negation; arity decided in the parser)
     Minus,
     /// `*`
@@ -70,6 +75,7 @@ impl Token {
             "bool" => Token::KwBool,
             "if" => Token::KwIf,
             "while" => Token::KwWhile,
+            "for" => Token::KwFor,
             "else" => Token::KwElse,
             "true" => Token::KwTrue,
             "false" => Token::KwFalse,

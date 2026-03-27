@@ -41,8 +41,16 @@ pub fn lex(source: &str) -> Result<Vec<Token>, LexError> {
 
         match b {
             b'+' => {
-                out.push(Token::Plus);
-                i += 1;
+                if bytes.get(i + 1) == Some(&b'+') {
+                    out.push(Token::PlusPlus);
+                    i += 2;
+                } else if bytes.get(i + 1) == Some(&b'=') {
+                    out.push(Token::PlusAssign);
+                    i += 2;
+                } else {
+                    out.push(Token::Plus);
+                    i += 1;
+                }
             }
             b'-' => {
                 out.push(Token::Minus);

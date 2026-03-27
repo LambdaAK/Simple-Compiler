@@ -29,6 +29,10 @@ pub enum Stmt {
     },
     /// `name = expr;`
     Assign { name: String, value: Expr },
+    /// `name += expr;`
+    AddAssign { name: String, rhs: Expr },
+    /// `name++;`
+    PostInc { name: String },
     /// `if (cond) ... [ else ... ]` — `cond` must have type `bool` (checked later).
     If {
         cond: Expr,
@@ -38,6 +42,13 @@ pub enum Stmt {
     /// `while (cond) stmt` — `cond` must be **`bool`**.
     While {
         cond: Expr,
+        body: Box<Stmt>,
+    },
+    /// `for (init; cond; step) stmt` — **`init`** is a variable declaration or assignment (or omitted); **`cond`** is **`bool`** or omitted (infinite loop); **`step`** is an assignment or omitted.
+    For {
+        init: Option<Box<Stmt>>,
+        cond: Option<Expr>,
+        step: Option<Box<Stmt>>,
         body: Box<Stmt>,
     },
     /// `{ stmt* }`
@@ -57,6 +68,8 @@ pub enum Expr {
     /// One byte (`'a'`, `'\n'`, …).
     CharLit(u8),
     Var(String),
+    /// Postfix `i++` — operand must be **`int`** or **`char`**; value is the old value (**`int`**).
+    PostInc(String),
     Unary(UnaryOp, Box<Expr>),
     Binary(BinOp, Box<Expr>, Box<Expr>),
 }

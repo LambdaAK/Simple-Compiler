@@ -10,11 +10,10 @@ _main:
     str x8, [sp, #0]
     ldr x8, [sp, #0]
     str x8, [sp, #8]
-L_while_head_0:
+L_for_head_0:
     ldr x8, [sp, #8]
     str x8, [sp, #16]
-    movz x8, #16960, lsl #0
-    movk x8, #15, lsl #16
+    movz x8, #1000, lsl #0
     str x8, [sp, #24]
     ldr x9, [sp, #16]
     ldr x10, [sp, #24]
@@ -22,7 +21,7 @@ L_while_head_0:
     cset x8, lt
     str x8, [sp, #32]
     ldr x8, [sp, #32]
-    cbz x8, L_while_end_1
+    cbz x8, L_for_end_1
     ldr x8, [sp, #8]
     str x8, [sp, #40]
     ldr x8, [sp, #40]
@@ -42,8 +41,8 @@ L_while_head_0:
     str x8, [sp, #64]
     ldr x8, [sp, #64]
     str x8, [sp, #8]
-    b L_while_head_0
-L_while_end_1:
+    b L_for_head_0
+L_for_end_1:
     mov sp, x29
     mov x0, #0
     ldp x29, x30, [sp], #16

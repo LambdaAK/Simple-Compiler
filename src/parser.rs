@@ -43,6 +43,13 @@ pub fn parse_program(source: &str) -> Result<Program, FrontEndError> {
     Parser::new(&tokens).parse_program()
 }
 
+#[derive(Clone, Copy)]
+enum AfterIdentEnd {
+    Semicolon,
+    /// For-step: closing `)` of `for (...)` is consumed after this clause.
+    ForStep,
+}
+
 struct Parser<'a> {
     tokens: &'a [Token],
     pos: usize,
@@ -83,39 +90,21 @@ impl<'a> Parser<'a> {
         match self.peek().clone() {
             Token::KwInt => {
                 self.bump();
-                let name = self.expect_ident()?;
-                self.consume(Token::Assign, "`=`")?;
-                let init = self.parse_expr()?;
+                let s = self.parse_var_decl_tail(Ty::Int)?;
                 self.consume(Token::Semicolon, "`;`")?;
-                Ok(Stmt::VarDecl {
-                    name,
-                    ty: Ty::Int,
-                    init,
-                })
+                Ok(s)
             }
             Token::KwBool => {
                 self.bump();
-                let name = self.expect_ident()?;
-                self.consume(Token::Assign, "`=`")?;
-                let init = self.parse_expr()?;
+                let s = self.parse_var_decl_tail(Ty::Bool)?;
                 self.consume(Token::Semicolon, "`;`")?;
-                Ok(Stmt::VarDecl {
-                    name,
-                    ty: Ty::Bool,
-                    init,
-                })
+                Ok(s)
             }
             Token::KwChar => {
                 self.bump();
-                let name = self.expect_ident()?;
-                self.consume(Token::Assign, "`=`")?;
-                let init = self.parse_expr()?;
+                let s = self.parse_var_decl_tail(Ty::Char)?;
                 self.consume(Token::Semicolon, "`;`")?;
-                Ok(Stmt::VarDecl {
-                    name,
-                    ty: Ty::Char,
-                    init,
-                })
+                Ok(s)
             }
             Token::KwPrintInt => {
                 self.bump();
@@ -167,18 +156,148 @@ impl<'a> Parser<'a> {
                 let body = Box::new(self.parse_stmt()?);
                 Ok(Stmt::While { cond, body })
             }
+            Token::KwFor => {
+                self.bump();
+                self.consume(Token::LParen, "`(`")?;
+                let init = self.parse_for_init()?;
+                let cond = self.parse_for_cond()?;
+                let step = self.parse_for_step()?;
+                self.consume(Token::RParen, "`)`")?;
+                let body = Box::new(self.parse_stmt()?);
+                Ok(Stmt::For {
+                    init,
+                    cond,
+                    step,
+                    body,
+                })
+            }
             Token::LBrace => Ok(Stmt::Block(self.parse_block()?)),
             Token::Ident(name) => {
                 self.bump();
-                self.consume(Token::Assign, "`=`")?;
-                let value = self.parse_expr()?;
-                self.consume(Token::Semicolon, "`;`")?;
-                Ok(Stmt::Assign { name, value })
+                self.parse_stmt_after_ident(name, AfterIdentEnd::Semicolon)
             }
             other => Err(self
                 .error(format!("statement cannot start with `{other:?}`"))
                 .into()),
         }
+    }
+
+    fn parse_var_decl_tail(&mut self, ty: Ty) -> Result<Stmt, FrontEndError> {
+        let name = self.expect_ident()?;
+        self.consume(Token::Assign, "`=`")?;
+        let init = self.parse_expr()?;
+        Ok(Stmt::VarDecl {
+            name,
+            ty,
+            init,
+        })
+    }
+
+    /// `int` / `bool` / `char` at the start of a declaration (keyword already consumed by caller).
+    fn parse_var_decl_stmt(&mut self) -> Result<Stmt, FrontEndError> {
+        match self.peek().clone() {
+            Token::KwInt => {
+                self.bump();
+                self.parse_var_decl_tail(Ty::Int)
+            }
+            Token::KwBool => {
+                self.bump();
+                self.parse_var_decl_tail(Ty::Bool)
+            }
+            Token::KwChar => {
+                self.bump();
+                self.parse_var_decl_tail(Ty::Char)
+            }
+            other => Err(self
+                .error(format!("expected `int`, `bool`, or `char` in for-init, found `{other:?}`"))
+                .into()),
+        }
+    }
+
+    /// `;` only → `None`; `int x = 0;` / `x = 0;` → `Some`.
+    fn parse_for_init(&mut self) -> Result<Option<Box<Stmt>>, FrontEndError> {
+        if matches!(self.peek(), Token::Semicolon) {
+            self.bump();
+            return Ok(None);
+        }
+        if matches!(
+            self.peek(),
+            Token::KwInt | Token::KwBool | Token::KwChar
+        ) {
+            let stmt = self.parse_var_decl_stmt()?;
+            self.consume(Token::Semicolon, "`;`")?;
+            return Ok(Some(Box::new(stmt)));
+        }
+        if let Token::Ident(name) = self.peek().clone() {
+            self.bump();
+            let s = self.parse_stmt_after_ident(name, AfterIdentEnd::Semicolon)?;
+            return Ok(Some(Box::new(s)));
+        }
+        Err(self
+            .error("expected `;`, `int`/`bool`/`char`, or `name =`/`+=`/`++` in for-init")
+            .into())
+    }
+
+    /// `;` only → `None`; else expression then `;`.
+    fn parse_for_cond(&mut self) -> Result<Option<Expr>, FrontEndError> {
+        if matches!(self.peek(), Token::Semicolon) {
+            self.bump();
+            return Ok(None);
+        }
+        let e = self.parse_expr()?;
+        self.consume(Token::Semicolon, "`;`")?;
+        Ok(Some(e))
+    }
+
+    /// `)` only → `None`; else `name = expr` before `)`.
+    fn parse_for_step(&mut self) -> Result<Option<Box<Stmt>>, FrontEndError> {
+        if matches!(self.peek(), Token::RParen) {
+            return Ok(None);
+        }
+        if let Token::Ident(name) = self.peek().clone() {
+            self.bump();
+            let s = self.parse_stmt_after_ident(name, AfterIdentEnd::ForStep)?;
+            return Ok(Some(Box::new(s)));
+        }
+        Err(self
+            .error("expected `)` or `name =` / `+=` / `++` in for-step")
+            .into())
+    }
+
+    /// After consuming the identifier: `=`, `+=`, or `++`, then `;` or `)`.
+    fn parse_stmt_after_ident(
+        &mut self,
+        name: String,
+        end: AfterIdentEnd,
+    ) -> Result<Stmt, FrontEndError> {
+        let stmt = match self.peek().clone() {
+            Token::Assign => {
+                self.bump();
+                let value = self.parse_expr()?;
+                Stmt::Assign { name, value }
+            }
+            Token::PlusAssign => {
+                self.bump();
+                let rhs = self.parse_expr()?;
+                Stmt::AddAssign { name, rhs }
+            }
+            Token::PlusPlus => {
+                self.bump();
+                Stmt::PostInc { name }
+            }
+            other => {
+                return Err(self
+                    .error(format!(
+                        "expected `=`, `+=`, or `++` after identifier, found `{other:?}`"
+                    ))
+                    .into());
+            }
+        };
+        match end {
+            AfterIdentEnd::Semicolon => self.consume(Token::Semicolon, "`;`")?,
+            AfterIdentEnd::ForStep => {}
+        }
+        Ok(stmt)
     }
 
     fn parse_block(&mut self) -> Result<Vec<Stmt>, FrontEndError> {
@@ -290,7 +409,25 @@ impl<'a> Parser<'a> {
             self.bump();
             return Ok(Expr::Unary(UnaryOp::Not, Box::new(self.parse_unary()?)));
         }
-        self.parse_primary()
+        self.parse_postfix()
+    }
+
+    fn parse_postfix(&mut self) -> Result<Expr, FrontEndError> {
+        let mut e = self.parse_primary()?;
+        while matches!(self.peek(), Token::PlusPlus) {
+            self.bump();
+            match e {
+                Expr::Var(name) => {
+                    e = Expr::PostInc(name);
+                }
+                _ => {
+                    return Err(self
+                        .error("`++` postfix only applies to a variable")
+                        .into());
+                }
+            }
+        }
+        Ok(e)
     }
 
     fn parse_primary(&mut self) -> Result<Expr, FrontEndError> {
@@ -362,6 +499,28 @@ mod tests {
     fn decl_and_assign() {
         let p = parse_program("int x = 1; x = x + 2;").unwrap();
         assert_eq!(p.stmts.len(), 2);
+    }
+
+    #[test]
+    fn post_inc_and_add_assign_stmts() {
+        let p = parse_program("int i = 0; i++; i += 1;").unwrap();
+        assert!(matches!(&p.stmts[1], Stmt::PostInc { .. }));
+        assert!(matches!(&p.stmts[2], Stmt::AddAssign { .. }));
+    }
+
+    #[test]
+    fn post_inc_in_expr() {
+        let p = parse_program("int i = 0; int j = i++;").unwrap();
+        let Stmt::VarDecl { init, .. } = &p.stmts[1] else {
+            panic!("expected var decl");
+        };
+        assert!(matches!(init, Expr::PostInc(_)));
+    }
+
+    #[test]
+    fn for_step_post_inc() {
+        let p = parse_program("for (int i = 0; i < 2; i++) { }").unwrap();
+        assert!(matches!(&p.stmts[0], Stmt::For { step: Some(b), .. } if matches!(**b, Stmt::PostInc { .. })));
     }
 
     #[test]

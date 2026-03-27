@@ -86,6 +86,15 @@ impl LowerCtx {
             Expr::BoolLit(_) => Ok(Ty::Bool),
             Expr::CharLit(_) => Ok(Ty::Char),
             Expr::Var(name) => Ok(self.resolve(name)?.1),
+            Expr::PostInc(name) => {
+                let (_, var_ty) = self.resolve(name)?;
+                match var_ty {
+                    Ty::Bool => Err(LowerError::TypeMismatch(
+                        "postfix `++` expects int or char variable".into(),
+                    )),
+                    Ty::Int | Ty::Char => Ok(Ty::Int),
+                }
+            }
             Expr::Unary(UnaryOp::Neg, e) => {
                 let t = self.expr_ty(e)?;
                 if t == Ty::Int || t == Ty::Char {
@@ -159,6 +168,7 @@ impl LowerCtx {
                 self.ir.push(Instr::LoadVar(dst.clone(), slot));
                 Ok(dst)
             }
+            Expr::PostInc(name) => self.lower_post_inc(name),
             Expr::Unary(op, inner) => {
                 let src = self.lower_expr(inner)?;
                 let dst = self.fresh_temp();
@@ -189,6 +199,85 @@ impl LowerCtx {
                 };
                 self.ir.push(instr);
                 Ok(dst)
+            }
+        }
+    }
+
+    /// Postfix `i++`: load old, add 1, store (mask **`char`** to 0–255), return old value (**`int`**).
+    fn lower_post_inc(&mut self, name: &str) -> Result<String, LowerError> {
+        let (slot, var_ty) = self.resolve(name)?;
+        match var_ty {
+            Ty::Bool => Err(LowerError::TypeMismatch(
+                "postfix `++` expects int or char variable".into(),
+            )),
+            Ty::Int => {
+                let old = self.fresh_temp();
+                self.ir.push(Instr::LoadVar(old.clone(), slot.clone()));
+                let one = self.fresh_temp();
+                self.ir.push(Instr::Const(one.clone(), 1));
+                let new = self.fresh_temp();
+                self.ir.push(Instr::Add(new.clone(), old.clone(), one));
+                self.ir.push(Instr::StoreVar(slot, new));
+                Ok(old)
+            }
+            Ty::Char => {
+                let old = self.fresh_temp();
+                self.ir.push(Instr::LoadVar(old.clone(), slot.clone()));
+                let one = self.fresh_temp();
+                self.ir.push(Instr::Const(one.clone(), 1));
+                let new = self.fresh_temp();
+                self.ir.push(Instr::Add(new.clone(), old.clone(), one));
+                let c255 = self.fresh_temp();
+                self.ir.push(Instr::Const(c255.clone(), 255));
+                let masked = self.fresh_temp();
+                self.ir.push(Instr::And(masked.clone(), new, c255));
+                self.ir.push(Instr::StoreVar(slot, masked));
+                Ok(old)
+            }
+        }
+    }
+
+    fn lower_add_assign(&mut self, name: &str, rhs: &Expr) -> Result<(), LowerError> {
+        let (slot, var_ty) = self.resolve(name)?;
+        match var_ty {
+            Ty::Bool => Err(LowerError::TypeMismatch(
+                "`+=` expects int or char variable".into(),
+            )),
+            Ty::Int => {
+                let rt = self.expr_ty(rhs)?;
+                let ok = |t: Ty| t == Ty::Int || t == Ty::Char;
+                if !ok(rt) {
+                    return Err(LowerError::TypeMismatch(format!(
+                        "`+=` to int expects int or char RHS, got {rt:?}"
+                    )));
+                }
+                let old = self.fresh_temp();
+                self.ir.push(Instr::LoadVar(old.clone(), slot.clone()));
+                let r = self.lower_expr(rhs)?;
+                let new = self.fresh_temp();
+                self.ir.push(Instr::Add(new.clone(), old, r));
+                self.ir.push(Instr::StoreVar(slot, new));
+                Ok(())
+            }
+            Ty::Char => {
+                let rt = self.expr_ty(rhs)?;
+                let ok = |t: Ty| t == Ty::Int || t == Ty::Char;
+                if !ok(rt) {
+                    return Err(LowerError::TypeMismatch(format!(
+                        "`+=` to char expects int or char RHS, got {rt:?}"
+                    )));
+                }
+                let old = self.fresh_temp();
+                self.ir.push(Instr::LoadVar(old.clone(), slot.clone()));
+                let r = self.lower_expr(rhs)?;
+                let new = self.fresh_temp();
+                self.ir.push(Instr::Add(new.clone(), old, r));
+                let c255 = self.fresh_temp();
+                self.ir.push(Instr::Const(c255.clone(), 255));
+                let masked = self.fresh_temp();
+                self.ir.push(Instr::And(masked.clone(), new, c255));
+                self.ir.push(Instr::StoreVar(slot, masked));
+                Ok(())
             }
         }
     }
@@ -238,6 +327,12 @@ impl LowerCtx {
                 }
                 let tmp = self.lower_expr(value)?;
                 self.ir.push(Instr::StoreVar(slot, tmp));
+            }
+            Stmt::AddAssign { name, rhs } => {
+                self.lower_add_assign(name, rhs)?;
+            }
+            Stmt::PostInc { name } => {
+                self.lower_post_inc(name)?;
             }
             Stmt::PrintInt { arg } => {
                 Self::expect_ty(self.expr_ty(arg)?, Ty::Int, "`print_int` argument")?;
@@ -305,6 +400,32 @@ impl LowerCtx {
                 self.pop_scope();
                 self.ir.push(Instr::Jump(head));
                 self.ir.push(Instr::Label(end));
+            }
+            Stmt::For {
+                init,
+                cond,
+                step,
+                body,
+            } => {
+                self.push_scope();
+                if let Some(init) = init {
+                    self.lower_stmt(init)?;
+                }
+                let head = self.fresh_label("for_head");
+                let end = self.fresh_label("for_end");
+                self.ir.push(Instr::Label(head.clone()));
+                if let Some(cond) = cond {
+                    Self::expect_ty(self.expr_ty(cond)?, Ty::Bool, "`for` condition")?;
+                    let c = self.lower_expr(cond)?;
+                    self.ir.push(Instr::JumpIfZero(c, end.clone()));
+                }
+                self.lower_stmt(body)?;
+                if let Some(step) = step {
+                    self.lower_stmt(step)?;
+                }
+                self.ir.push(Instr::Jump(head));
+                self.ir.push(Instr::Label(end));
+                self.pop_scope();
             }
         }
         Ok(())
@@ -416,6 +537,44 @@ mod tests {
             ir.instrs
                 .iter()
                 .any(|i| matches!(i, Instr::Label(l) if l.contains("while"))),
+            "{ir:?}"
+        );
+    }
+
+    #[test]
+    fn for_loop_desugar() {
+        let p = parse_program("for (int i = 0; i < 3; i = i + 1) { print_int(i); }").unwrap();
+        let ir = lower_program(&p).unwrap();
+        assert!(
+            ir.instrs
+                .iter()
+                .any(|i| matches!(i, Instr::Label(l) if l.contains("for_head"))),
+            "{ir:?}"
+        );
+    }
+
+    #[test]
+    fn post_inc_and_add_assign() {
+        let p = parse_program("int i = 0; i++; i += 2; print_int(i);").unwrap();
+        let ir = lower_program(&p).unwrap();
+        let adds = ir
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, Instr::Add(_, _, _)))
+            .count();
+        assert!(adds >= 2, "{ir:?}");
+    }
+
+    #[test]
+    fn post_inc_expr_value() {
+        let p = parse_program("int i = 0; print_int(i++); print_int(i);").unwrap();
+        let ir = lower_program(&p).unwrap();
+        assert!(
+            ir.instrs
+                .iter()
+                .filter(|i| matches!(i, Instr::PrintInt(_)))
+                .count()
+                >= 2,
             "{ir:?}"
         );
     }
