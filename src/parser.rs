@@ -90,19 +90,19 @@ impl<'a> Parser<'a> {
         match self.peek().clone() {
             Token::KwInt => {
                 self.bump();
-                let s = self.parse_var_decl_tail(Ty::Int)?;
+                let s = self.parse_decl_tail_after_type(Ty::Int)?;
                 self.consume(Token::Semicolon, "`;`")?;
                 Ok(s)
             }
             Token::KwBool => {
                 self.bump();
-                let s = self.parse_var_decl_tail(Ty::Bool)?;
+                let s = self.parse_decl_tail_after_type(Ty::Bool)?;
                 self.consume(Token::Semicolon, "`;`")?;
                 Ok(s)
             }
             Token::KwChar => {
                 self.bump();
-                let s = self.parse_var_decl_tail(Ty::Char)?;
+                let s = self.parse_decl_tail_after_type(Ty::Char)?;
                 self.consume(Token::Semicolon, "`;`")?;
                 Ok(s)
             }
@@ -174,7 +174,14 @@ impl<'a> Parser<'a> {
             Token::LBrace => Ok(Stmt::Block(self.parse_block()?)),
             Token::Ident(name) => {
                 self.bump();
-                self.parse_stmt_after_ident(name, AfterIdentEnd::Semicolon)
+                if matches!(self.peek(), Token::LBracket) {
+                    self.bump();
+                    let index = self.parse_expr()?;
+                    self.consume(Token::RBracket, "`]`")?;
+                    self.parse_stmt_after_index_subscript(name, index, AfterIdentEnd::Semicolon)
+                } else {
+                    self.parse_stmt_after_ident(name, AfterIdentEnd::Semicolon)
+                }
             }
             other => Err(self
                 .error(format!("statement cannot start with `{other:?}`"))
@@ -182,13 +189,37 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_var_decl_tail(&mut self, ty: Ty) -> Result<Stmt, FrontEndError> {
+    /// After `int` / `bool` / `char`: `name = expr` or `name [ N ]`.
+    fn parse_decl_tail_after_type(&mut self, elem: Ty) -> Result<Stmt, FrontEndError> {
         let name = self.expect_ident()?;
+        if matches!(self.peek(), Token::LBracket) {
+            self.bump();
+            let len = match self.bump() {
+                Token::IntLit(n) => n,
+                other => {
+                    return Err(self
+                        .error(format!(
+                            "array length must be a positive integer literal, found `{other:?}`"
+                        ))
+                        .into());
+                }
+            };
+            if len <= 0 {
+                return Err(self.error("array length must be positive").into());
+            }
+            let len = len as usize;
+            self.consume(Token::RBracket, "`]`")?;
+            return Ok(Stmt::ArrayDecl {
+                name,
+                elem_ty: elem,
+                len,
+            });
+        }
         self.consume(Token::Assign, "`=`")?;
         let init = self.parse_expr()?;
         Ok(Stmt::VarDecl {
             name,
-            ty,
+            ty: elem,
             init,
         })
     }
@@ -198,15 +229,15 @@ impl<'a> Parser<'a> {
         match self.peek().clone() {
             Token::KwInt => {
                 self.bump();
-                self.parse_var_decl_tail(Ty::Int)
+                self.parse_decl_tail_after_type(Ty::Int)
             }
             Token::KwBool => {
                 self.bump();
-                self.parse_var_decl_tail(Ty::Bool)
+                self.parse_decl_tail_after_type(Ty::Bool)
             }
             Token::KwChar => {
                 self.bump();
-                self.parse_var_decl_tail(Ty::Char)
+                self.parse_decl_tail_after_type(Ty::Char)
             }
             other => Err(self
                 .error(format!("expected `int`, `bool`, or `char` in for-init, found `{other:?}`"))
@@ -230,11 +261,18 @@ impl<'a> Parser<'a> {
         }
         if let Token::Ident(name) = self.peek().clone() {
             self.bump();
-            let s = self.parse_stmt_after_ident(name, AfterIdentEnd::Semicolon)?;
+            let s = if matches!(self.peek(), Token::LBracket) {
+                self.bump();
+                let index = self.parse_expr()?;
+                self.consume(Token::RBracket, "`]`")?;
+                self.parse_stmt_after_index_subscript(name, index, AfterIdentEnd::Semicolon)?
+            } else {
+                self.parse_stmt_after_ident(name, AfterIdentEnd::Semicolon)?
+            };
             return Ok(Some(Box::new(s)));
         }
         Err(self
-            .error("expected `;`, `int`/`bool`/`char`, or `name =`/`+=`/`++` in for-init")
+            .error("expected `;`, `int`/`bool`/`char`, or assignment/`+=`/`++` in for-init")
             .into())
     }
 
@@ -256,11 +294,18 @@ impl<'a> Parser<'a> {
         }
         if let Token::Ident(name) = self.peek().clone() {
             self.bump();
-            let s = self.parse_stmt_after_ident(name, AfterIdentEnd::ForStep)?;
+            let s = if matches!(self.peek(), Token::LBracket) {
+                self.bump();
+                let index = self.parse_expr()?;
+                self.consume(Token::RBracket, "`]`")?;
+                self.parse_stmt_after_index_subscript(name, index, AfterIdentEnd::ForStep)?
+            } else {
+                self.parse_stmt_after_ident(name, AfterIdentEnd::ForStep)?
+            };
             return Ok(Some(Box::new(s)));
         }
         Err(self
-            .error("expected `)` or `name =` / `+=` / `++` in for-step")
+            .error("expected `)` or assignment / `+=` / `++` in for-step")
             .into())
     }
 
@@ -298,6 +343,35 @@ impl<'a> Parser<'a> {
             AfterIdentEnd::ForStep => {}
         }
         Ok(stmt)
+    }
+
+    fn parse_stmt_after_index_subscript(
+        &mut self,
+        base: String,
+        index: Expr,
+        end: AfterIdentEnd,
+    ) -> Result<Stmt, FrontEndError> {
+        match self.peek().clone() {
+            Token::Assign => {
+                self.bump();
+                let value = self.parse_expr()?;
+                let stmt = Stmt::IndexAssign {
+                    base,
+                    index,
+                    value,
+                };
+                match end {
+                    AfterIdentEnd::Semicolon => self.consume(Token::Semicolon, "`;`")?,
+                    AfterIdentEnd::ForStep => {}
+                }
+                Ok(stmt)
+            }
+            other => Err(self
+                .error(format!(
+                    "expected `=` after `a[i]`, found `{other:?}`"
+                ))
+                .into()),
+        }
     }
 
     fn parse_block(&mut self) -> Result<Vec<Stmt>, FrontEndError> {
@@ -414,18 +488,41 @@ impl<'a> Parser<'a> {
 
     fn parse_postfix(&mut self) -> Result<Expr, FrontEndError> {
         let mut e = self.parse_primary()?;
-        while matches!(self.peek(), Token::PlusPlus) {
-            self.bump();
-            match e {
-                Expr::Var(name) => {
-                    e = Expr::PostInc(name);
+        loop {
+            if matches!(self.peek(), Token::LBracket) {
+                self.bump();
+                let ix = self.parse_expr()?;
+                self.consume(Token::RBracket, "`]`")?;
+                match e {
+                    Expr::Var(name) => {
+                        e = Expr::Index {
+                            base: name,
+                            index: Box::new(ix),
+                        };
+                    }
+                    _ => {
+                        return Err(self
+                            .error("`[` only applies to an array variable")
+                            .into());
+                    }
                 }
-                _ => {
-                    return Err(self
-                        .error("`++` postfix only applies to a variable")
-                        .into());
-                }
+                continue;
             }
+            if matches!(self.peek(), Token::PlusPlus) {
+                self.bump();
+                match e {
+                    Expr::Var(name) => {
+                        e = Expr::PostInc(name);
+                    }
+                    _ => {
+                        return Err(self
+                            .error("`++` postfix only applies to a variable")
+                            .into());
+                    }
+                }
+                continue;
+            }
+            break;
         }
         Ok(e)
     }
@@ -499,6 +596,13 @@ mod tests {
     fn decl_and_assign() {
         let p = parse_program("int x = 1; x = x + 2;").unwrap();
         assert_eq!(p.stmts.len(), 2);
+    }
+
+    #[test]
+    fn array_decl_and_index_expr() {
+        let p = parse_program("int a[3]; a[1] = 42; print_int(a[1]);").unwrap();
+        assert!(matches!(&p.stmts[0], Stmt::ArrayDecl { len: 3, .. }));
+        assert!(matches!(&p.stmts[1], Stmt::IndexAssign { .. }));
     }
 
     #[test]

@@ -115,6 +115,16 @@ fn collect_slots(instrs: &[Instr]) -> Vec<String> {
                 note(v);
                 note(s);
             }
+            Instr::LoadIndex(d, first, idx, _) => {
+                note(d);
+                note(first);
+                note(idx);
+            }
+            Instr::StoreIndex(first, idx, src, _) => {
+                note(first);
+                note(idx);
+                note(src);
+            }
             Instr::JumpIfZero(c, _) => note(c),
             Instr::PrintInt(t) | Instr::PrintBool(t) | Instr::PrintChar(t) => note(t),
             Instr::Label(_) | Instr::Jump(_) => {}
@@ -144,6 +154,16 @@ fn str_stack(o: &mut String, reg: &str, slot_off: usize) {
 }
 
 /// Load `imm` into `rd` (64-bit). Uses one `mov` when the assembler constant fits.
+/// `rd = sp + off` (handles large frame offsets).
+fn add_sp_offset(o: &mut String, rd: &str, off: usize) {
+    if off <= 4095 {
+        writeln!(o, "    add {rd}, sp, #{}", off).unwrap();
+    } else {
+        mov_i64(o, rd, off as i64);
+        writeln!(o, "    add {rd}, sp, {rd}").unwrap();
+    }
+}
+
 fn mov_i64(o: &mut String, rd: &str, imm: i64) {
     if imm >= -0x100 && imm <= 0xff {
         writeln!(o, "    mov {rd}, #{imm}").unwrap();
@@ -245,6 +265,18 @@ fn emit_instr(
         Instr::StoreVar(var, src) => {
             ldr_stack(o, "x8", oa(src));
             str_stack(o, "x8", oa(var));
+        }
+        Instr::LoadIndex(dst, first_slot, idx, _len) => {
+            ldr_stack(o, "x10", oa(idx));
+            add_sp_offset(o, "x9", oa(first_slot));
+            writeln!(o, "    ldr x8, [x9, x10, lsl #3]").unwrap();
+            str_stack(o, "x8", oa(dst));
+        }
+        Instr::StoreIndex(first_slot, idx, src, _len) => {
+            ldr_stack(o, "x10", oa(idx));
+            ldr_stack(o, "x8", oa(src));
+            add_sp_offset(o, "x9", oa(first_slot));
+            writeln!(o, "    str x8, [x9, x10, lsl #3]").unwrap();
         }
         Instr::Label(name) => {
             writeln!(o, "{}:", asm_label(name)).unwrap();

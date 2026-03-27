@@ -11,10 +11,20 @@ pub enum LowerError {
     TypeMismatch(String),
 }
 
+#[derive(Debug, Clone)]
+enum Binding {
+    Scalar { slot: String, ty: Ty },
+    /// Contiguous stack slots; `first_slot` is element 0.
+    Array {
+        first_slot: String,
+        elem: Ty,
+        len: usize,
+    },
+}
+
 struct LowerCtx {
     ir: IrProgram,
-    /// Lexical scopes: source name → (IR slot, type).
-    scopes: Vec<HashMap<String, (String, Ty)>>,
+    scopes: Vec<HashMap<String, Binding>>,
     temp_id: usize,
     label_id: usize,
     slot_id: usize,
@@ -49,17 +59,68 @@ impl LowerCtx {
         self.scopes
             .last_mut()
             .expect("lower: always at least one scope")
-            .insert(source_name.to_string(), (slot.clone(), ty));
+            .insert(
+                source_name.to_string(),
+                Binding::Scalar {
+                    slot: slot.clone(),
+                    ty,
+                },
+            );
         slot
     }
 
-    fn resolve(&self, source_name: &str) -> Result<(String, Ty), LowerError> {
+    fn declare_array(&mut self, source_name: &str, elem: Ty, len: usize) {
+        let start = self.slot_id;
+        self.slot_id += len;
+        let first_slot = format!("v{}", start);
+        self.scopes
+            .last_mut()
+            .expect("lower: always at least one scope")
+            .insert(
+                source_name.to_string(),
+                Binding::Array {
+                    first_slot: first_slot.clone(),
+                    elem,
+                    len,
+                },
+            );
+        for i in 0..len {
+            let slot = format!("v{}", start + i);
+            let z = self.fresh_temp();
+            self.ir.push(Instr::Const(z.clone(), 0));
+            self.ir.push(Instr::StoreVar(slot, z));
+        }
+    }
+
+    fn resolve(&self, source_name: &str) -> Result<Binding, LowerError> {
         for scope in self.scopes.iter().rev() {
-            if let Some((s, t)) = scope.get(source_name) {
-                return Ok((s.clone(), *t));
+            if let Some(b) = scope.get(source_name) {
+                return Ok(b.clone());
             }
         }
         Err(LowerError::UndefinedVariable(source_name.to_string()))
+    }
+
+    fn resolve_scalar(&self, source_name: &str) -> Result<(String, Ty), LowerError> {
+        match self.resolve(source_name)? {
+            Binding::Scalar { slot, ty } => Ok((slot, ty)),
+            Binding::Array { .. } => Err(LowerError::TypeMismatch(format!(
+                "`{source_name}` is an array; use `{source_name}[i]`"
+            ))),
+        }
+    }
+
+    fn resolve_array(&self, source_name: &str) -> Result<(String, Ty, usize), LowerError> {
+        match self.resolve(source_name)? {
+            Binding::Array {
+                first_slot,
+                elem,
+                len,
+            } => Ok((first_slot, elem, len)),
+            Binding::Scalar { .. } => Err(LowerError::TypeMismatch(format!(
+                "`{source_name}` is not an array"
+            ))),
+        }
     }
 
     fn push_scope(&mut self) {
@@ -85,9 +146,25 @@ impl LowerCtx {
             Expr::IntLit(_) => Ok(Ty::Int),
             Expr::BoolLit(_) => Ok(Ty::Bool),
             Expr::CharLit(_) => Ok(Ty::Char),
-            Expr::Var(name) => Ok(self.resolve(name)?.1),
+            Expr::Var(name) => match self.resolve(name)? {
+                Binding::Scalar { ty, .. } => Ok(ty),
+                Binding::Array { .. } => Err(LowerError::TypeMismatch(format!(
+                    "array `{name}` cannot be used as a scalar value"
+                ))),
+            },
+            Expr::Index { base, index } => {
+                let (_, elem, _) = self.resolve_array(base)?;
+                let it = self.expr_ty(index)?;
+                let ok = |t: Ty| t == Ty::Int || t == Ty::Char;
+                if !ok(it) {
+                    return Err(LowerError::TypeMismatch(format!(
+                        "array index must be int or char, got {it:?}"
+                    )));
+                }
+                Ok(elem)
+            }
             Expr::PostInc(name) => {
-                let (_, var_ty) = self.resolve(name)?;
+                let (_, var_ty) = self.resolve_scalar(name)?;
                 match var_ty {
                     Ty::Bool => Err(LowerError::TypeMismatch(
                         "postfix `++` expects int or char variable".into(),
@@ -163,9 +240,18 @@ impl LowerCtx {
                 Ok(dst)
             }
             Expr::Var(name) => {
-                let (slot, _) = self.resolve(name)?;
+                let (slot, _) = self.resolve_scalar(name)?;
                 let dst = self.fresh_temp();
                 self.ir.push(Instr::LoadVar(dst.clone(), slot));
+                Ok(dst)
+            }
+            Expr::Index { base, index } => {
+                let (first, _, len) = self.resolve_array(base)?;
+                let idx_t = self.lower_expr(index)?;
+                let dst = self.fresh_temp();
+                self
+                    .ir
+                    .push(Instr::LoadIndex(dst.clone(), first, idx_t, len));
                 Ok(dst)
             }
             Expr::PostInc(name) => self.lower_post_inc(name),
@@ -205,7 +291,7 @@ impl LowerCtx {
 
     /// Postfix `i++`: load old, add 1, store (mask **`char`** to 0–255), return old value (**`int`**).
     fn lower_post_inc(&mut self, name: &str) -> Result<String, LowerError> {
-        let (slot, var_ty) = self.resolve(name)?;
+        let (slot, var_ty) = self.resolve_scalar(name)?;
         match var_ty {
             Ty::Bool => Err(LowerError::TypeMismatch(
                 "postfix `++` expects int or char variable".into(),
@@ -238,7 +324,7 @@ impl LowerCtx {
     }
 
     fn lower_add_assign(&mut self, name: &str, rhs: &Expr) -> Result<(), LowerError> {
-        let (slot, var_ty) = self.resolve(name)?;
+        let (slot, var_ty) = self.resolve_scalar(name)?;
         match var_ty {
             Ty::Bool => Err(LowerError::TypeMismatch(
                 "`+=` expects int or char variable".into(),
@@ -303,8 +389,11 @@ impl LowerCtx {
                 let tmp = self.lower_expr(init)?;
                 self.ir.push(Instr::StoreVar(slot, tmp));
             }
+            Stmt::ArrayDecl { name, elem_ty, len } => {
+                self.declare_array(name, *elem_ty, *len);
+            }
             Stmt::Assign { name, value } => {
-                let (slot, var_ty) = self.resolve(name)?;
+                let (slot, var_ty) = self.resolve_scalar(name)?;
                 match var_ty {
                     Ty::Char => match value {
                         Expr::IntLit(n) => {
@@ -327,6 +416,47 @@ impl LowerCtx {
                 }
                 let tmp = self.lower_expr(value)?;
                 self.ir.push(Instr::StoreVar(slot, tmp));
+            }
+            Stmt::IndexAssign {
+                base,
+                index,
+                value,
+            } => {
+                let (first, elem_ty, len) = self.resolve_array(base)?;
+                match elem_ty {
+                    Ty::Char => match value {
+                        Expr::IntLit(n) => {
+                            if *n < 0 || *n > 255 {
+                                return Err(LowerError::TypeMismatch(format!(
+                                    "assign to `char` from integer must be 0..=255, got {}",
+                                    *n
+                                )));
+                            }
+                        }
+                        _ => {
+                            let val_ty = self.expr_ty(value)?;
+                            Self::expect_ty(val_ty, Ty::Char, "assignment to `char[]` element")?;
+                        }
+                    },
+                    _ => {
+                        let val_ty = self.expr_ty(value)?;
+                        Self::expect_ty(val_ty, elem_ty, "assignment to array element")?;
+                    }
+                }
+                let idx_t = self.lower_expr(index)?;
+                let val_t = self.lower_expr(value)?;
+                let stored = if elem_ty == Ty::Char {
+                    let c255 = self.fresh_temp();
+                    self.ir.push(Instr::Const(c255.clone(), 255));
+                    let masked = self.fresh_temp();
+                    self.ir.push(Instr::And(masked.clone(), val_t, c255));
+                    masked
+                } else {
+                    val_t
+                };
+                self
+                    .ir
+                    .push(Instr::StoreIndex(first, idx_t, stored, len));
             }
             Stmt::AddAssign { name, rhs } => {
                 self.lower_add_assign(name, rhs)?;
@@ -575,6 +705,24 @@ mod tests {
                 .filter(|i| matches!(i, Instr::PrintInt(_)))
                 .count()
                 >= 2,
+            "{ir:?}"
+        );
+    }
+
+    #[test]
+    fn stack_array_load_store_index() {
+        let p = parse_program("int a[3]; a[1] = 42; print_int(a[1]);").unwrap();
+        let ir = lower_program(&p).unwrap();
+        assert!(
+            ir.instrs
+                .iter()
+                .any(|i| matches!(i, Instr::LoadIndex(_, _, _, _))),
+            "{ir:?}"
+        );
+        assert!(
+            ir.instrs
+                .iter()
+                .any(|i| matches!(i, Instr::StoreIndex(_, _, _, _))),
             "{ir:?}"
         );
     }

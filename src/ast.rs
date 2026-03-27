@@ -3,6 +3,8 @@
 //! Abstract syntax for a small C-shaped language: **`int`**, **`bool`**, **`char`** (one byte / ASCII + escapes).
 //!
 //! Typing is enforced while lowering: `if` conditions must be **`bool`**, **`char`** promotes like C for `+`/`-`/comparisons with **`int`**.
+//!
+//! **Arrays** are fixed-size (`int a[10];`), stored as contiguous stack slots (one 8-byte word per element).
 
 /// Value types in the surface language.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -27,8 +29,20 @@ pub enum Stmt {
         ty: Ty,
         init: Expr,
     },
+    /// `int a[10];` / `bool flags[2];` — elements are zero-initialized.
+    ArrayDecl {
+        name: String,
+        elem_ty: Ty,
+        len: usize,
+    },
     /// `name = expr;`
     Assign { name: String, value: Expr },
+    /// `a[i] = expr;`
+    IndexAssign {
+        base: String,
+        index: Expr,
+        value: Expr,
+    },
     /// `name += expr;`
     AddAssign { name: String, rhs: Expr },
     /// `name++;`
@@ -68,6 +82,11 @@ pub enum Expr {
     /// One byte (`'a'`, `'\n'`, …).
     CharLit(u8),
     Var(String),
+    /// `a[i]` — **`base`** names an array; index is **`int`** or **`char`** (promoted); value type is the element type.
+    Index {
+        base: String,
+        index: Box<Expr>,
+    },
     /// Postfix `i++` — operand must be **`int`** or **`char`**; value is the old value (**`int`**).
     PostInc(String),
     Unary(UnaryOp, Box<Expr>),

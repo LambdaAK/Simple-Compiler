@@ -80,6 +80,14 @@ pub fn lex(source: &str) -> Result<Vec<Token>, LexError> {
                 out.push(Token::RBrace);
                 i += 1;
             }
+            b'[' => {
+                out.push(Token::LBracket);
+                i += 1;
+            }
+            b']' => {
+                out.push(Token::RBracket);
+                i += 1;
+            }
             b';' => {
                 out.push(Token::Semicolon);
                 i += 1;

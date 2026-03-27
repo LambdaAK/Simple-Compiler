@@ -64,6 +64,11 @@ pub enum Instr {
     /// `*name = src`
     StoreVar(String, Temp),
 
+    /// `dst = first_slot[index]` — `first_slot` is the IR slot for element 0; elements are contiguous 8-byte words.
+    LoadIndex(Temp, String, Temp, usize),
+    /// `first_slot[index] = src`
+    StoreIndex(String, Temp, Temp, usize),
+
     // --- host / libc I/O (lowering only; macOS uses `_printf`) ---
     /// Print one signed 64-bit line (`%lld\\n`).
     PrintInt(Temp),
