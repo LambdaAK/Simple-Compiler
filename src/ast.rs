@@ -35,6 +35,10 @@ pub enum Stmt {
     },
     /// `{ stmt* }`
     Block(Vec<Stmt>),
+    /// `print_int(expr);` — `expr` must be **`int`**.
+    PrintInt { arg: Expr },
+    /// `print_bool(expr);` — `expr` must be **`bool`**.
+    PrintBool { arg: Expr },
 }
 
 #[derive(Debug, Clone, PartialEq)]

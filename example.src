@@ -11,3 +11,8 @@ if (ok) {
 } else {
     c = 0;
 }
+
+print_int(c);
+print_bool(ok);
+
+print_int(1);

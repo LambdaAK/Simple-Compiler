@@ -63,6 +63,12 @@ pub enum Instr {
     /// `*name = src`
     StoreVar(String, Temp),
 
+    // --- host / libc I/O (lowering only; macOS uses `_printf`) ---
+    /// Print one signed 64-bit line (`%lld\\n`).
+    PrintInt(Temp),
+    /// Print `true` or `false` plus newline (operand is `0` or `1`).
+    PrintBool(Temp),
+
     // --- control flow ---
     Label(String),
     Jump(String),

@@ -105,6 +105,22 @@ impl<'a> Parser<'a> {
                     init,
                 })
             }
+            Token::KwPrintInt => {
+                self.bump();
+                self.consume(Token::LParen, "`(`")?;
+                let arg = self.parse_expr()?;
+                self.consume(Token::RParen, "`)`")?;
+                self.consume(Token::Semicolon, "`;`")?;
+                Ok(Stmt::PrintInt { arg })
+            }
+            Token::KwPrintBool => {
+                self.bump();
+                self.consume(Token::LParen, "`(`")?;
+                let arg = self.parse_expr()?;
+                self.consume(Token::RParen, "`)`")?;
+                self.consume(Token::Semicolon, "`;`")?;
+                Ok(Stmt::PrintBool { arg })
+            }
             Token::KwIf => {
                 self.bump();
                 self.consume(Token::LParen, "`(`")?;

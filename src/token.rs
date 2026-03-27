@@ -9,6 +9,8 @@ pub enum Token {
     KwElse,
     KwTrue,
     KwFalse,
+    KwPrintInt,
+    KwPrintBool,
 
     // --- identifiers & literals ---
     Ident(String),
@@ -65,6 +67,8 @@ impl Token {
             "else" => Token::KwElse,
             "true" => Token::KwTrue,
             "false" => Token::KwFalse,
+            "print_int" => Token::KwPrintInt,
+            "print_bool" => Token::KwPrintBool,
             _ => return None,
         };
         Some(tok)

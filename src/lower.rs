@@ -2,18 +2,19 @@
 
 use std::collections::HashMap;
 
-use crate::ast::{BinOp, Expr, Program, Stmt, UnaryOp};
+use crate::ast::{BinOp, Expr, Program, Stmt, Ty, UnaryOp};
 use crate::ir::{Instr, IrProgram};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LowerError {
     UndefinedVariable(String),
+    TypeMismatch(String),
 }
 
 struct LowerCtx {
     ir: IrProgram,
-    /// Lexical scopes: source name → unique IR variable slot (e.g. `v3`).
-    scopes: Vec<HashMap<String, String>>,
+    /// Lexical scopes: source name → (IR slot, type).
+    scopes: Vec<HashMap<String, (String, Ty)>>,
     temp_id: usize,
     label_id: usize,
     slot_id: usize,
@@ -42,20 +43,20 @@ impl LowerCtx {
         l
     }
 
-    fn declare(&mut self, source_name: &str) -> String {
+    fn declare(&mut self, source_name: &str, ty: Ty) -> String {
         let slot = format!("v{}", self.slot_id);
         self.slot_id += 1;
         self.scopes
             .last_mut()
             .expect("lower: always at least one scope")
-            .insert(source_name.to_string(), slot.clone());
+            .insert(source_name.to_string(), (slot.clone(), ty));
         slot
     }
 
-    fn resolve(&self, source_name: &str) -> Result<String, LowerError> {
+    fn resolve(&self, source_name: &str) -> Result<(String, Ty), LowerError> {
         for scope in self.scopes.iter().rev() {
-            if let Some(slot) = scope.get(source_name) {
-                return Ok(slot.clone());
+            if let Some((s, t)) = scope.get(source_name) {
+                return Ok((s.clone(), *t));
             }
         }
         Err(LowerError::UndefinedVariable(source_name.to_string()))
@@ -72,6 +73,53 @@ impl LowerCtx {
         assert!(!self.scopes.is_empty(), "lower: root scope must remain");
     }
 
+    fn expect_ty(got: Ty, want: Ty, msg: &str) -> Result<(), LowerError> {
+        if got != want {
+            return Err(LowerError::TypeMismatch(format!("{msg} (got {got:?}, want {want:?})")));
+        }
+        Ok(())
+    }
+
+    fn expr_ty(&self, expr: &Expr) -> Result<Ty, LowerError> {
+        match expr {
+            Expr::IntLit(_) => Ok(Ty::Int),
+            Expr::BoolLit(_) => Ok(Ty::Bool),
+            Expr::Var(name) => Ok(self.resolve(name)?.1),
+            Expr::Unary(UnaryOp::Neg, e) => {
+                Self::expect_ty(self.expr_ty(e)?, Ty::Int, "unary `-` expects int operand")?;
+                Ok(Ty::Int)
+            }
+            Expr::Unary(UnaryOp::Not, e) => {
+                Self::expect_ty(self.expr_ty(e)?, Ty::Bool, "unary `!` expects bool operand")?;
+                Ok(Ty::Bool)
+            }
+            Expr::Binary(op, l, r) => {
+                let lt = self.expr_ty(l)?;
+                let rt = self.expr_ty(r)?;
+                match op {
+                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => {
+                        Self::expect_ty(lt, Ty::Int, &format!("`{op:?}` LHS"))?;
+                        Self::expect_ty(rt, Ty::Int, &format!("`{op:?}` RHS"))?;
+                        Ok(Ty::Int)
+                    }
+                    BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                        if lt != rt {
+                            return Err(LowerError::TypeMismatch(format!(
+                                "comparison expects matching types, got {lt:?} and {rt:?}"
+                            )));
+                        }
+                        Ok(Ty::Bool)
+                    }
+                    BinOp::And | BinOp::Or => {
+                        Self::expect_ty(lt, Ty::Bool, &format!("`{op:?}` LHS"))?;
+                        Self::expect_ty(rt, Ty::Bool, &format!("`{op:?}` RHS"))?;
+                        Ok(Ty::Bool)
+                    }
+                }
+            }
+        }
+    }
+
     fn lower_expr(&mut self, expr: &Expr) -> Result<String, LowerError> {
         match expr {
             Expr::IntLit(n) => {
@@ -86,7 +134,7 @@ impl LowerCtx {
                 Ok(dst)
             }
             Expr::Var(name) => {
-                let slot = self.resolve(name)?;
+                let (slot, _) = self.resolve(name)?;
                 let dst = self.fresh_temp();
                 self.ir.push(Instr::LoadVar(dst.clone(), slot));
                 Ok(dst)
@@ -127,15 +175,29 @@ impl LowerCtx {
 
     fn lower_stmt(&mut self, stmt: &Stmt) -> Result<(), LowerError> {
         match stmt {
-            Stmt::VarDecl { name, init, .. } => {
-                let slot = self.declare(name);
+            Stmt::VarDecl { name, ty, init } => {
+                let init_ty = self.expr_ty(init)?;
+                Self::expect_ty(init_ty, *ty, "variable initializer vs declared type")?;
+                let slot = self.declare(name, *ty);
                 let tmp = self.lower_expr(init)?;
                 self.ir.push(Instr::StoreVar(slot, tmp));
             }
             Stmt::Assign { name, value } => {
-                let slot = self.resolve(name)?;
+                let (slot, var_ty) = self.resolve(name)?;
+                let val_ty = self.expr_ty(value)?;
+                Self::expect_ty(val_ty, var_ty, "assignment RHS vs variable type")?;
                 let tmp = self.lower_expr(value)?;
                 self.ir.push(Instr::StoreVar(slot, tmp));
+            }
+            Stmt::PrintInt { arg } => {
+                Self::expect_ty(self.expr_ty(arg)?, Ty::Int, "`print_int` argument")?;
+                let tmp = self.lower_expr(arg)?;
+                self.ir.push(Instr::PrintInt(tmp));
+            }
+            Stmt::PrintBool { arg } => {
+                Self::expect_ty(self.expr_ty(arg)?, Ty::Bool, "`print_bool` argument")?;
+                let tmp = self.lower_expr(arg)?;
+                self.ir.push(Instr::PrintBool(tmp));
             }
             Stmt::Block(stmts) => {
                 self.push_scope();
@@ -149,6 +211,7 @@ impl LowerCtx {
                 then_branch,
                 else_branch,
             } => {
+                Self::expect_ty(self.expr_ty(cond)?, Ty::Bool, "`if` condition")?;
                 let c = self.lower_expr(cond)?;
                 let end_l = self.fresh_label("end_if");
 
@@ -246,5 +309,25 @@ mod tests {
         };
         let ir = lower_program(&p).unwrap();
         assert!(ir.instrs.iter().any(|i| matches!(i, Instr::Const(_, 0))));
+    }
+
+    #[test]
+    fn print_int_ir() {
+        let p = parse_program("print_int(42);").unwrap();
+        let ir = lower_program(&p).unwrap();
+        assert!(ir
+            .instrs
+            .iter()
+            .any(|i| matches!(i, Instr::PrintInt(t) if t.starts_with('t')))
+            );
+    }
+
+    #[test]
+    fn print_bool_type_error() {
+        let p = parse_program("print_bool(1);").unwrap();
+        assert!(matches!(
+            lower_program(&p),
+            Err(LowerError::TypeMismatch(_))
+        ));
     }
 }

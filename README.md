@@ -4,7 +4,7 @@ Small ARM64-oriented compiler project: **lex → parse → typecheck → IR → 
 
 ## Grammar
 
-Lexical rules (informal): whitespace separates tokens; **`//` comments** (if you add them in the lexer) run to end of line. Identifiers match `[A-Za-z_][A-Za-z0-9_]*`; integer literals match `[0-9]+` (value must fit `i64`). Keywords are reserved: `int`, `bool`, `if`, `else`, `true`, `false`.
+Lexical rules (informal): whitespace separates tokens; **`//` comments** (if you add them in the lexer) run to end of line. Identifiers match `[A-Za-z_][A-Za-z0-9_]*`; integer literals match `[0-9]+` (value must fit `i64`). Keywords are reserved: `int`, `bool`, `if`, `else`, `true`, `false`, `print_int`, `print_bool`.
 
 Operator precedence follows C-like rules: **weaker** operators appear **higher** in the chain (`||` through `primary`), so precedence **increases** toward `primary`.
 
@@ -13,6 +13,8 @@ program   ::= stmt* ;
 
 stmt      ::= type IDENT "=" expr ";"
             | IDENT "=" expr ";"
+            | "print_int" "(" expr ")" ";"
+            | "print_bool" "(" expr ")" ";"
             | "if" "(" expr ")" stmt else_part?
             | block ;
 
@@ -55,6 +57,7 @@ These are **semantic** constraints for a later checker; the grammar above accept
 - Unary `-` applies to **`int`**; unary `!` applies to **`bool`**.
 - `&&`, `||` take **`bool`** operands and yield **`bool`**.
 - In `type IDENT "=" expr ";"`, the initializer **`expr`** must match **`type`**.
+- `print_int(expr)` requires **`int`**; `print_bool(expr)` requires **`bool`**.
 
 ### Dangling `else`
 

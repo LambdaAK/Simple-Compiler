@@ -1,10 +1,10 @@
-//! CLI: `compiler <path-to-source>` — parse, lower to IR, print instructions on stdout.
+//! CLI: `compiler <path-to-source>` — parse, lower to IR, emit ARM64 `output.s` in cwd.
 
 use std::env;
 use std::fs;
 use std::process::ExitCode;
 
-use compiler::{lower_program, parse_program};
+use compiler::{emit_arm64, lower_program, parse_program};
 
 fn main() -> ExitCode {
     let mut args = env::args_os();
@@ -39,9 +39,13 @@ fn main() -> ExitCode {
         }
     };
 
-    for instr in &ir.instrs {
-        println!("{instr:?}");
+    let asm = emit_arm64(&ir);
+    let out = "output.s";
+    if let Err(e) = fs::write(out, asm) {
+        eprintln!("{out}: {e}");
+        return ExitCode::from(1);
     }
+    eprintln!("wrote {out} — run: clang {out} -o program && ./program");
 
     ExitCode::SUCCESS
 }
