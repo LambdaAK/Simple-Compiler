@@ -1,20 +1,7 @@
-// Small demo for `cargo run -- example.src`
+int i = 0;
 
-int a = 10;
-int b = 3;
-int c = a + b * 2;
-
-bool ok = c > 15;
-
-if (ok) {
-    c = c - 1;
-} else {
-    c = 0;
+while (i < 1000000) {
+    print_int(i);
+    i = i + 1;
 }
 
-char ch = 'Z';
-char nl = '\n';
-print_char(ch);
-print_char(nl);
-char from_int = 67;
-print_char(from_int);

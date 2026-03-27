@@ -4,7 +4,7 @@ Small ARM64-oriented compiler project: **lex → parse → typecheck → IR → 
 
 ## Grammar
 
-Lexical rules (informal): whitespace separates tokens; **`//` comments** (if you add them in the lexer) run to end of line. Identifiers match `[A-Za-z_][A-Za-z0-9_]*`; integer literals match `[0-9]+` (value must fit `i64`). **Character literals** use **`'`** … **`'`** around one byte, with escapes `\'`, `\\`, `\n`, `\t`, `\r`, `\0`. Keywords are reserved: `int`, `bool`, `char`, `if`, `else`, `true`, `false`, `print_int`, `print_bool`, `print_char`.
+Lexical rules (informal): whitespace separates tokens; **`//` comments** (if you add them in the lexer) run to end of line. Identifiers match `[A-Za-z_][A-Za-z0-9_]*`; integer literals match `[0-9]+` (value must fit `i64`). **Character literals** use **`'`** … **`'`** around one byte, with escapes `\'`, `\\`, `\n`, `\t`, `\r`, `\0`. Keywords are reserved: `int`, `bool`, `char`, `if`, `while`, `else`, `true`, `false`, `print_int`, `print_bool`, `print_char`.
 
 Operator precedence follows C-like rules: **weaker** operators appear **higher** in the chain (`||` through `primary`), so precedence **increases** toward `primary`.
 
@@ -17,6 +17,7 @@ stmt      ::= type IDENT "=" expr ";"
             | "print_bool" "(" expr ")" ";"
             | "print_char" "(" expr ")" ";"
             | "if" "(" expr ")" stmt else_part?
+            | "while" "(" expr ")" stmt
             | block ;
 
 else_part ::= "else" stmt ;
@@ -53,7 +54,7 @@ primary   ::= INT_LIT
 
 These are enforced while **lowering** to IR; the grammar above accepts only the shape of programs.
 
-- `if` **condition** must be **`bool`** (no `if (int)`).
+- `if` **condition** must be **`bool`** (no `if (int)`). Same for **`while`**.
 - **`char`** is a **single byte** (0–255). It is stored in a 64-bit stack word (zero-extended) in IR, like a tiny integer for codegen.
 - **`char` literals** have type **`char`**. An **`int`** literal **0..=255** may initialize or assign to **`char`** (C-style narrowing for constants).
 - **`char`** promotes like C: with **`int`** in **`+` `-` `*` `/`** (operands **`int`** or **`char`**, result **`int`**). Unary **`-`** on **`char`** yields **`int`**.

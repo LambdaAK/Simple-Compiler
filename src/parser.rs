@@ -159,6 +159,14 @@ impl<'a> Parser<'a> {
                     else_branch,
                 })
             }
+            Token::KwWhile => {
+                self.bump();
+                self.consume(Token::LParen, "`(`")?;
+                let cond = self.parse_expr()?;
+                self.consume(Token::RParen, "`)`")?;
+                let body = Box::new(self.parse_stmt()?);
+                Ok(Stmt::While { cond, body })
+            }
             Token::LBrace => Ok(Stmt::Block(self.parse_block()?)),
             Token::Ident(name) => {
                 self.bump();

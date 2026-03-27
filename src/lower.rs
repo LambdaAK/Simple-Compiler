@@ -293,6 +293,19 @@ impl LowerCtx {
                     }
                 }
             }
+            Stmt::While { cond, body } => {
+                Self::expect_ty(self.expr_ty(cond)?, Ty::Bool, "`while` condition")?;
+                let head = self.fresh_label("while_head");
+                let end = self.fresh_label("while_end");
+                self.ir.push(Instr::Label(head.clone()));
+                let c = self.lower_expr(cond)?;
+                self.ir.push(Instr::JumpIfZero(c, end.clone()));
+                self.push_scope();
+                self.lower_stmt(body)?;
+                self.pop_scope();
+                self.ir.push(Instr::Jump(head));
+                self.ir.push(Instr::Label(end));
+            }
         }
         Ok(())
     }
@@ -391,5 +404,19 @@ mod tests {
         let p = parse_program("char c = 'A'; print_char(c); char d = 66; print_char(d);").unwrap();
         let ir = lower_program(&p).unwrap();
         assert!(ir.instrs.iter().filter(|i| matches!(i, Instr::PrintChar(_))).count() >= 2);
+    }
+
+    #[test]
+    fn while_loop_jump_pattern() {
+        let p = parse_program("int i = 0; while (i < 3) { i = i + 1; }").unwrap();
+        let ir = lower_program(&p).unwrap();
+        let jumps = ir.instrs.iter().filter(|i| matches!(i, Instr::Jump(_))).count();
+        assert!(jumps >= 1, "{ir:?}");
+        assert!(
+            ir.instrs
+                .iter()
+                .any(|i| matches!(i, Instr::Label(l) if l.contains("while"))),
+            "{ir:?}"
+        );
     }
 }

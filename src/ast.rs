@@ -35,6 +35,11 @@ pub enum Stmt {
         then_branch: Box<Stmt>,
         else_branch: Option<Box<Stmt>>,
     },
+    /// `while (cond) stmt` — `cond` must be **`bool`**.
+    While {
+        cond: Expr,
+        body: Box<Stmt>,
+    },
     /// `{ stmt* }`
     Block(Vec<Stmt>),
     /// `print_int(expr);` — `expr` must be **`int`**.
