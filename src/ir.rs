@@ -1,5 +1,3 @@
-#![allow(dead_code)] // Produced by lowering; used by codegen once wired up.
-
 //! Three-address intermediate representation for a **single procedure** (e.g. `_main`).
 //!
 //! - Each instruction is one step; results go into a [`Temp`] or named variables via [`Instr::LoadVar`] / [`Instr::StoreVar`].

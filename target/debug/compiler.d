@@ -1,0 +1,1 @@
+/Users/alex/Desktop/compiler/target/debug/compiler: /Users/alex/Desktop/compiler/src/ast.rs /Users/alex/Desktop/compiler/src/ir.rs /Users/alex/Desktop/compiler/src/lexer.rs /Users/alex/Desktop/compiler/src/lib.rs /Users/alex/Desktop/compiler/src/lower.rs /Users/alex/Desktop/compiler/src/main.rs /Users/alex/Desktop/compiler/src/parser.rs /Users/alex/Desktop/compiler/src/token.rs

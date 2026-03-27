@@ -1,0 +1,13 @@
+// Small demo for `cargo run -- example.src`
+
+int a = 10;
+int b = 3;
+int c = a + b * 2;
+
+bool ok = c > 15;
+
+if (ok) {
+    c = c - 1;
+} else {
+    c = 0;
+}
