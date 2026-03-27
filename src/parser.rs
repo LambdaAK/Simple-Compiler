@@ -105,6 +105,18 @@ impl<'a> Parser<'a> {
                     init,
                 })
             }
+            Token::KwChar => {
+                self.bump();
+                let name = self.expect_ident()?;
+                self.consume(Token::Assign, "`=`")?;
+                let init = self.parse_expr()?;
+                self.consume(Token::Semicolon, "`;`")?;
+                Ok(Stmt::VarDecl {
+                    name,
+                    ty: Ty::Char,
+                    init,
+                })
+            }
             Token::KwPrintInt => {
                 self.bump();
                 self.consume(Token::LParen, "`(`")?;
@@ -120,6 +132,14 @@ impl<'a> Parser<'a> {
                 self.consume(Token::RParen, "`)`")?;
                 self.consume(Token::Semicolon, "`;`")?;
                 Ok(Stmt::PrintBool { arg })
+            }
+            Token::KwPrintChar => {
+                self.bump();
+                self.consume(Token::LParen, "`(`")?;
+                let arg = self.parse_expr()?;
+                self.consume(Token::RParen, "`)`")?;
+                self.consume(Token::Semicolon, "`;`")?;
+                Ok(Stmt::PrintChar { arg })
             }
             Token::KwIf => {
                 self.bump();
@@ -270,6 +290,10 @@ impl<'a> Parser<'a> {
             Token::IntLit(n) => {
                 self.bump();
                 Ok(Expr::IntLit(n))
+            }
+            Token::CharLit(b) => {
+                self.bump();
+                Ok(Expr::CharLit(b))
             }
             Token::KwTrue => {
                 self.bump();

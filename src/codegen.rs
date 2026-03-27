@@ -10,10 +10,12 @@ use crate::ir::{Instr, IrProgram};
 
 /// ARM64 assembly for a single `\_main` (text section, machO-style symbol).
 pub fn emit_arm64(ir: &IrProgram) -> String {
-    let needs_printf = ir
-        .instrs
-        .iter()
-        .any(|i| matches!(i, Instr::PrintInt(_) | Instr::PrintBool(_)));
+    let needs_printf = ir.instrs.iter().any(|i| {
+        matches!(
+            i,
+            Instr::PrintInt(_) | Instr::PrintBool(_) | Instr::PrintChar(_)
+        )
+    });
 
     let slots = collect_slots(&ir.instrs);
     let n = slots.len();
@@ -58,6 +60,8 @@ pub fn emit_arm64(ir: &IrProgram) -> String {
         writeln!(o, "    .asciz \"true\\n\"").unwrap();
         writeln!(o, "L_pr_false:").unwrap();
         writeln!(o, "    .asciz \"false\\n\"").unwrap();
+        writeln!(o, "L_pr_char_fmt:").unwrap();
+        writeln!(o, "    .asciz \"%c\\n\"").unwrap();
     }
 
     o
@@ -112,7 +116,7 @@ fn collect_slots(instrs: &[Instr]) -> Vec<String> {
                 note(s);
             }
             Instr::JumpIfZero(c, _) => note(c),
-            Instr::PrintInt(t) | Instr::PrintBool(t) => note(t),
+            Instr::PrintInt(t) | Instr::PrintBool(t) | Instr::PrintChar(t) => note(t),
             Instr::Label(_) | Instr::Jump(_) => {}
         }
     }
@@ -281,6 +285,16 @@ fn emit_instr(
             writeln!(o, "    add x0, x0, L_pr_false@PAGEOFF").unwrap();
             writeln!(o, "    bl _printf").unwrap();
             writeln!(o, "{}:", lbl_end).unwrap();
+        }
+        Instr::PrintChar(temp) => {
+            assert!(needs_printf);
+            ldr_stack(o, "x8", oa(temp));
+            writeln!(o, "    sub sp, sp, #32").unwrap();
+            writeln!(o, "    str x8, [sp]").unwrap();
+            writeln!(o, "    adrp x0, L_pr_char_fmt@PAGE").unwrap();
+            writeln!(o, "    add x0, x0, L_pr_char_fmt@PAGEOFF").unwrap();
+            writeln!(o, "    bl _printf").unwrap();
+            writeln!(o, "    add sp, sp, #32").unwrap();
         }
     }
 }

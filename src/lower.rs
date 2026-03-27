@@ -84,10 +84,17 @@ impl LowerCtx {
         match expr {
             Expr::IntLit(_) => Ok(Ty::Int),
             Expr::BoolLit(_) => Ok(Ty::Bool),
+            Expr::CharLit(_) => Ok(Ty::Char),
             Expr::Var(name) => Ok(self.resolve(name)?.1),
             Expr::Unary(UnaryOp::Neg, e) => {
-                Self::expect_ty(self.expr_ty(e)?, Ty::Int, "unary `-` expects int operand")?;
-                Ok(Ty::Int)
+                let t = self.expr_ty(e)?;
+                if t == Ty::Int || t == Ty::Char {
+                    Ok(Ty::Int)
+                } else {
+                    Err(LowerError::TypeMismatch(
+                        "unary `-` expects int or char operand".into(),
+                    ))
+                }
             }
             Expr::Unary(UnaryOp::Not, e) => {
                 Self::expect_ty(self.expr_ty(e)?, Ty::Bool, "unary `!` expects bool operand")?;
@@ -98,14 +105,21 @@ impl LowerCtx {
                 let rt = self.expr_ty(r)?;
                 match op {
                     BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => {
-                        Self::expect_ty(lt, Ty::Int, &format!("`{op:?}` LHS"))?;
-                        Self::expect_ty(rt, Ty::Int, &format!("`{op:?}` RHS"))?;
+                        let ok = |t: Ty| t == Ty::Int || t == Ty::Char;
+                        if !ok(lt) || !ok(rt) {
+                            return Err(LowerError::TypeMismatch(format!(
+                                "`{op:?}` expects int or char operands, got {lt:?} and {rt:?}"
+                            )));
+                        }
                         Ok(Ty::Int)
                     }
                     BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
-                        if lt != rt {
+                        let bool_cmp = lt == Ty::Bool && rt == Ty::Bool;
+                        let num_cmp = (lt == Ty::Int || lt == Ty::Char)
+                            && (rt == Ty::Int || rt == Ty::Char);
+                        if !bool_cmp && !num_cmp {
                             return Err(LowerError::TypeMismatch(format!(
-                                "comparison expects matching types, got {lt:?} and {rt:?}"
+                                "comparison expects both bool or both numeric (int/char), got {lt:?} and {rt:?}"
                             )));
                         }
                         Ok(Ty::Bool)
@@ -131,6 +145,12 @@ impl LowerCtx {
                 let dst = self.fresh_temp();
                 self.ir
                     .push(Instr::Const(dst.clone(), if *b { 1 } else { 0 }));
+                Ok(dst)
+            }
+            Expr::CharLit(b) => {
+                let dst = self.fresh_temp();
+                self.ir
+                    .push(Instr::Const(dst.clone(), i64::from(*b)));
                 Ok(dst)
             }
             Expr::Var(name) => {
@@ -176,16 +196,46 @@ impl LowerCtx {
     fn lower_stmt(&mut self, stmt: &Stmt) -> Result<(), LowerError> {
         match stmt {
             Stmt::VarDecl { name, ty, init } => {
-                let init_ty = self.expr_ty(init)?;
-                Self::expect_ty(init_ty, *ty, "variable initializer vs declared type")?;
+                match (*ty, init) {
+                    (Ty::Char, Expr::IntLit(n)) => {
+                        if *n < 0 || *n > 255 {
+                            return Err(LowerError::TypeMismatch(format!(
+                                "`char` initializer from integer must be 0..=255, got {}",
+                                *n
+                            )));
+                        }
+                    }
+                    _ => {
+                        let init_ty = self.expr_ty(init)?;
+                        Self::expect_ty(init_ty, *ty, "variable initializer vs declared type")?;
+                    }
+                }
                 let slot = self.declare(name, *ty);
                 let tmp = self.lower_expr(init)?;
                 self.ir.push(Instr::StoreVar(slot, tmp));
             }
             Stmt::Assign { name, value } => {
                 let (slot, var_ty) = self.resolve(name)?;
-                let val_ty = self.expr_ty(value)?;
-                Self::expect_ty(val_ty, var_ty, "assignment RHS vs variable type")?;
+                match var_ty {
+                    Ty::Char => match value {
+                        Expr::IntLit(n) => {
+                            if *n < 0 || *n > 255 {
+                                return Err(LowerError::TypeMismatch(format!(
+                                    "assign to `char` from integer must be 0..=255, got {}",
+                                    *n
+                                )));
+                            }
+                        }
+                        _ => {
+                            let val_ty = self.expr_ty(value)?;
+                            Self::expect_ty(val_ty, Ty::Char, "assignment to `char`")?;
+                        }
+                    },
+                    _ => {
+                        let val_ty = self.expr_ty(value)?;
+                        Self::expect_ty(val_ty, var_ty, "assignment RHS vs variable type")?;
+                    }
+                }
                 let tmp = self.lower_expr(value)?;
                 self.ir.push(Instr::StoreVar(slot, tmp));
             }
@@ -198,6 +248,11 @@ impl LowerCtx {
                 Self::expect_ty(self.expr_ty(arg)?, Ty::Bool, "`print_bool` argument")?;
                 let tmp = self.lower_expr(arg)?;
                 self.ir.push(Instr::PrintBool(tmp));
+            }
+            Stmt::PrintChar { arg } => {
+                Self::expect_ty(self.expr_ty(arg)?, Ty::Char, "`print_char` argument")?;
+                let tmp = self.lower_expr(arg)?;
+                self.ir.push(Instr::PrintChar(tmp));
             }
             Stmt::Block(stmts) => {
                 self.push_scope();
@@ -329,5 +384,12 @@ mod tests {
             lower_program(&p),
             Err(LowerError::TypeMismatch(_))
         ));
+    }
+
+    #[test]
+    fn char_literal_print_and_int_init() {
+        let p = parse_program("char c = 'A'; print_char(c); char d = 66; print_char(d);").unwrap();
+        let ir = lower_program(&p).unwrap();
+        assert!(ir.instrs.iter().filter(|i| matches!(i, Instr::PrintChar(_))).count() >= 2);
     }
 }

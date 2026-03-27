@@ -4,7 +4,7 @@ Small ARM64-oriented compiler project: **lex → parse → typecheck → IR → 
 
 ## Grammar
 
-Lexical rules (informal): whitespace separates tokens; **`//` comments** (if you add them in the lexer) run to end of line. Identifiers match `[A-Za-z_][A-Za-z0-9_]*`; integer literals match `[0-9]+` (value must fit `i64`). Keywords are reserved: `int`, `bool`, `if`, `else`, `true`, `false`, `print_int`, `print_bool`.
+Lexical rules (informal): whitespace separates tokens; **`//` comments** (if you add them in the lexer) run to end of line. Identifiers match `[A-Za-z_][A-Za-z0-9_]*`; integer literals match `[0-9]+` (value must fit `i64`). **Character literals** use **`'`** … **`'`** around one byte, with escapes `\'`, `\\`, `\n`, `\t`, `\r`, `\0`. Keywords are reserved: `int`, `bool`, `char`, `if`, `else`, `true`, `false`, `print_int`, `print_bool`, `print_char`.
 
 Operator precedence follows C-like rules: **weaker** operators appear **higher** in the chain (`||` through `primary`), so precedence **increases** toward `primary`.
 
@@ -15,6 +15,7 @@ stmt      ::= type IDENT "=" expr ";"
             | IDENT "=" expr ";"
             | "print_int" "(" expr ")" ";"
             | "print_bool" "(" expr ")" ";"
+            | "print_char" "(" expr ")" ";"
             | "if" "(" expr ")" stmt else_part?
             | block ;
 
@@ -22,7 +23,7 @@ else_part ::= "else" stmt ;
 
 block     ::= "{" stmt* "}" ;
 
-type      ::= "int" | "bool" ;
+type      ::= "int" | "bool" | "char" ;
 
 expr      ::= or_expr ;
 
@@ -41,6 +42,7 @@ mul_expr  ::= unary { ("*" | "/") unary } ;
 unary     ::= ("-" | "!") unary | primary ;
 
 primary   ::= INT_LIT
+            | CHAR_LIT
             | "true"
             | "false"
             | IDENT
@@ -49,15 +51,16 @@ primary   ::= INT_LIT
 
 ### Typing (static rules, not syntax)
 
-These are **semantic** constraints for a later checker; the grammar above accepts only the shape of programs.
+These are enforced while **lowering** to IR; the grammar above accepts only the shape of programs.
 
-- `if` **condition** must have type **`bool`** (strict; no `if (int)`).
-- `==`, `!=`, `<`, `<=`, `>`, `>=` take two operands of the **same** type (`int`/`int` or `bool`/`bool`) and yield **`bool`**.
-- `+`, `-`, `*`, `/` take **`int`** operands and yield **`int`**.
-- Unary `-` applies to **`int`**; unary `!` applies to **`bool`**.
-- `&&`, `||` take **`bool`** operands and yield **`bool`**.
-- In `type IDENT "=" expr ";"`, the initializer **`expr`** must match **`type`**.
-- `print_int(expr)` requires **`int`**; `print_bool(expr)` requires **`bool`**.
+- `if` **condition** must be **`bool`** (no `if (int)`).
+- **`char`** is a **single byte** (0–255). It is stored in a 64-bit stack word (zero-extended) in IR, like a tiny integer for codegen.
+- **`char` literals** have type **`char`**. An **`int`** literal **0..=255** may initialize or assign to **`char`** (C-style narrowing for constants).
+- **`char`** promotes like C: with **`int`** in **`+` `-` `*` `/`** (operands **`int`** or **`char`**, result **`int`**). Unary **`-`** on **`char`** yields **`int`**.
+- Comparisons **`==` … `>=`**: either **both `bool`** or **both numeric** (**`int`** / **`char`** in any mix); result **`bool`**.
+- Unary **`!`** only on **`bool`**. **`&&` / `||`**: **`bool`** only.
+- For **`int` / `bool` / `char`** declarations, the initializer must match the type, except **`char`** may use an **`int`** literal in **0..=255**.
+- **`print_int`** → **`int`**; **`print_bool`** → **`bool`**; **`print_char`** → **`char`**.
 
 ### Dangling `else`
 

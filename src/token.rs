@@ -11,10 +11,14 @@ pub enum Token {
     KwFalse,
     KwPrintInt,
     KwPrintBool,
+    KwChar,
+    KwPrintChar,
 
     // --- identifiers & literals ---
     Ident(String),
     IntLit(i64),
+    /// One ASCII / byte (`'x'`, `'\n'`, …).
+    CharLit(u8),
 
     // --- operators ---
     /// `+`
@@ -69,6 +73,8 @@ impl Token {
             "false" => Token::KwFalse,
             "print_int" => Token::KwPrintInt,
             "print_bool" => Token::KwPrintBool,
+            "char" => Token::KwChar,
+            "print_char" => Token::KwPrintChar,
             _ => return None,
         };
         Some(tok)

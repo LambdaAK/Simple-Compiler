@@ -12,7 +12,9 @@ if (ok) {
     c = 0;
 }
 
-print_int(c);
-print_bool(ok);
-
-print_int(1);
+char ch = 'Z';
+char nl = '\n';
+print_char(ch);
+print_char(nl);
+char from_int = 67;
+print_char(from_int);

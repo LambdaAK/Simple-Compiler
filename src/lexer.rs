@@ -128,6 +128,49 @@ pub fn lex(source: &str) -> Result<Vec<Token>, LexError> {
                     return Err(LexError::new(i, "expected `||`"));
                 }
             }
+            b'\'' => {
+                i += 1;
+                if i >= bytes.len() {
+                    return Err(LexError::new(i - 1, "unclosed character literal"));
+                }
+                let byte = if bytes[i] == b'\\' {
+                    i += 1;
+                    if i >= bytes.len() {
+                        return Err(LexError::new(i - 1, "unclosed character literal after `\\`"));
+                    }
+                    match bytes[i] {
+                        b'n' => b'\n',
+                        b't' => b'\t',
+                        b'r' => b'\r',
+                        b'0' => 0,
+                        b'\\' => b'\\',
+                        b'\'' => b'\'',
+                        c => {
+                            return Err(LexError::new(
+                                i,
+                                format!("unknown escape `\\{}` in character literal", c as char),
+                            ));
+                        }
+                    }
+                } else {
+                    if bytes[i] == b'\n' {
+                        return Err(LexError::new(i, "newline in character literal"));
+                    }
+                    if bytes[i] == b'\'' {
+                        return Err(LexError::new(i, "empty character literal"));
+                    }
+                    bytes[i]
+                };
+                i += 1;
+                if i >= bytes.len() || bytes[i] != b'\'' {
+                    return Err(LexError::new(
+                        i.saturating_sub(1),
+                        "expected `'` to close character literal",
+                    ));
+                }
+                i += 1;
+                out.push(Token::CharLit(byte));
+            }
             b'0'..=b'9' => {
                 let start = i;
                 let mut value: i64 = 0;

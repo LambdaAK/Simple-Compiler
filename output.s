@@ -5,7 +5,7 @@
 _main:
     stp x29, x30, [sp, #-16]!
     mov x29, sp
-    sub sp, sp, #176
+    sub sp, sp, #224
     mov x8, #10
     str x8, [sp, #0]
     ldr x8, [sp, #0]
@@ -62,35 +62,43 @@ L_else_1:
     ldr x8, [sp, #144]
     str x8, [sp, #72]
 L_end_if_0:
-    ldr x8, [sp, #72]
+    mov x8, #90
     str x8, [sp, #152]
     ldr x8, [sp, #152]
-    sub sp, sp, #32
-    str x8, [sp]
-    adrp x0, L_pr_int_fmt@PAGE
-    add x0, x0, L_pr_int_fmt@PAGEOFF
-    bl _printf
-    add sp, sp, #32
-    ldr x8, [sp, #104]
     str x8, [sp, #160]
-    ldr x8, [sp, #160]
-    cbz x8, L_prb_0_false
-    adrp x0, L_pr_true@PAGE
-    add x0, x0, L_pr_true@PAGEOFF
-    bl _printf
-    b L_prb_0_end
-L_prb_0_false:
-    adrp x0, L_pr_false@PAGE
-    add x0, x0, L_pr_false@PAGEOFF
-    bl _printf
-L_prb_0_end:
-    mov x8, #1
+    mov x8, #10
     str x8, [sp, #168]
     ldr x8, [sp, #168]
+    str x8, [sp, #176]
+    ldr x8, [sp, #160]
+    str x8, [sp, #184]
+    ldr x8, [sp, #184]
     sub sp, sp, #32
     str x8, [sp]
-    adrp x0, L_pr_int_fmt@PAGE
-    add x0, x0, L_pr_int_fmt@PAGEOFF
+    adrp x0, L_pr_char_fmt@PAGE
+    add x0, x0, L_pr_char_fmt@PAGEOFF
+    bl _printf
+    add sp, sp, #32
+    ldr x8, [sp, #176]
+    str x8, [sp, #192]
+    ldr x8, [sp, #192]
+    sub sp, sp, #32
+    str x8, [sp]
+    adrp x0, L_pr_char_fmt@PAGE
+    add x0, x0, L_pr_char_fmt@PAGEOFF
+    bl _printf
+    add sp, sp, #32
+    mov x8, #67
+    str x8, [sp, #200]
+    ldr x8, [sp, #200]
+    str x8, [sp, #208]
+    ldr x8, [sp, #208]
+    str x8, [sp, #216]
+    ldr x8, [sp, #216]
+    sub sp, sp, #32
+    str x8, [sp]
+    adrp x0, L_pr_char_fmt@PAGE
+    add x0, x0, L_pr_char_fmt@PAGEOFF
     bl _printf
     add sp, sp, #32
     mov sp, x29
@@ -105,3 +113,5 @@ L_pr_true:
     .asciz "true\n"
 L_pr_false:
     .asciz "false\n"
+L_pr_char_fmt:
+    .asciz "%c\n"

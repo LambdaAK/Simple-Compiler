@@ -1,14 +1,16 @@
 #![allow(dead_code)] // Built by the parser, typechecker, and tests.
 
-//! Abstract syntax for a small C-shaped language with **`int`** and **`bool`** only.
+//! Abstract syntax for a small C-shaped language: **`int`**, **`bool`**, **`char`** (one byte / ASCII + escapes).
 //!
-//! Typing is enforced in a later pass: e.g. `if` conditions must be **`bool`**, arithmetic only on **`int`**, etc.
+//! Typing is enforced while lowering: `if` conditions must be **`bool`**, **`char`** promotes like C for `+`/`-`/comparisons with **`int`**.
 
 /// Value types in the surface language.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Ty {
     Int,
     Bool,
+    /// Single byte (values 0–255 in memory; use **`char`** literals or **`int`** literals 0–255 where allowed).
+    Char,
 }
 
 /// A full program: a flat list of statements (blocks nest inside statements).
@@ -39,12 +41,16 @@ pub enum Stmt {
     PrintInt { arg: Expr },
     /// `print_bool(expr);` — `expr` must be **`bool`**.
     PrintBool { arg: Expr },
+    /// `print_char(expr);` — `expr` must be **`char`** (byte printed with `%c`).
+    PrintChar { arg: Expr },
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     IntLit(i64),
     BoolLit(bool),
+    /// One byte (`'a'`, `'\n'`, …).
+    CharLit(u8),
     Var(String),
     Unary(UnaryOp, Box<Expr>),
     Binary(BinOp, Box<Expr>, Box<Expr>),
@@ -52,7 +58,7 @@ pub enum Expr {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum UnaryOp {
-    /// `-` on `int`
+    /// `-` on `int` or `char` (result **`int`**, C-style promotion)
     Neg,
     /// `!` on `bool`
     Not,

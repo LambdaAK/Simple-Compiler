@@ -2,6 +2,7 @@
 //!
 //! - Each instruction is one step; results go into a [`Temp`] or named variables via [`Instr::LoadVar`] / [`Instr::StoreVar`].
 //! - AST **`bool`** lowers to an **`i64` word**: `0` or `1` (same representation as in registers).
+//! - **`char`** is a byte stored in the low 8 bits of an **`i64`** stack word (zero-extended).
 //! - `And` / `Or` assume operands are already `0`/`1`; use them when expressions are side-effect-free,
 //!   or lower `&&` / `||` with branches later for full C short-circuit semantics.
 
@@ -68,6 +69,8 @@ pub enum Instr {
     PrintInt(Temp),
     /// Print `true` or `false` plus newline (operand is `0` or `1`).
     PrintBool(Temp),
+    /// `printf("%%c\\n", byte)` via the same Apple variadic stack convention as [`Instr::PrintInt`].
+    PrintChar(Temp),
 
     // --- control flow ---
     Label(String),
