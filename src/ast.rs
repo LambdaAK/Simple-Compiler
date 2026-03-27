@@ -5,6 +5,8 @@
 //! Typing is enforced while lowering: `if` conditions must be **`bool`**, **`char`** promotes like C for `+`/`-`/comparisons with **`int`**.
 //!
 //! **Arrays** are fixed-size (`int a[10];`), stored as contiguous stack slots (one 8-byte word per element).
+//!
+//! **C strings on the stack:** `char s[] = "text";` (NUL-terminated); **`print_string("...")`** or **`print_string(s)`** prints characters then a newline.
 
 /// Value types in the surface language.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -34,6 +36,18 @@ pub enum Stmt {
         name: String,
         elem_ty: Ty,
         len: usize,
+    },
+    /// `char s[] = "hello";` — length includes a trailing NUL (C string); stack slots per byte.
+    CharArrayFromString {
+        name: String,
+        /// Bytes copied into stack storage, including the final **`0`** terminator.
+        bytes: Vec<u8>,
+    },
+    /// `int a[] = { 1, 2, 3 };` / `bool f[] = { true };` — length inferred from the list.
+    ArrayFromExprs {
+        name: String,
+        elem_ty: Ty,
+        elements: Vec<Expr>,
     },
     /// `name = expr;`
     Assign { name: String, value: Expr },
@@ -73,6 +87,8 @@ pub enum Stmt {
     PrintBool { arg: Expr },
     /// `print_char(expr);` — `expr` must be **`char`** (byte printed with `%c`).
     PrintChar { arg: Expr },
+    /// `print_string("...")` or `print_string(s)` where **`s`** is **`char[]`**; uses **`%s`** (NUL-terminated).
+    PrintString { arg: Expr },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -81,6 +97,8 @@ pub enum Expr {
     BoolLit(bool),
     /// One byte (`'a'`, `'\n'`, …).
     CharLit(u8),
+    /// `"..."` — may only appear in `print_string("...")` (not a general expression type).
+    StringLit(Vec<u8>),
     Var(String),
     /// `a[i]` — **`base`** names an array; index is **`int`** or **`char`** (promoted); value type is the element type.
     Index {

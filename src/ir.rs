@@ -63,6 +63,8 @@ pub enum Instr {
     LoadVar(Temp, String),
     /// `*name = src`
     StoreVar(String, Temp),
+    /// `*name = imm` without a temp — keeps **`v0 .. v(n-1)`** consecutive so [`Instr::LoadIndex`] / [`Instr::StoreIndex`] stay valid.
+    StoreVarImm(String, i64),
 
     /// `dst = first_slot[index]` — `first_slot` is the IR slot for element 0; elements are contiguous 8-byte words.
     LoadIndex(Temp, String, Temp, usize),
@@ -76,6 +78,10 @@ pub enum Instr {
     PrintBool(Temp),
     /// `printf("%%c\\n", byte)` via the same Apple variadic stack convention as [`Instr::PrintInt`].
     PrintChar(Temp),
+    /// `printf("%%c", byte)` — no trailing newline from the format string.
+    PrintCharOnly(Temp),
+    /// `printf("\\n")` — end a line (used after `print_string`'s character loop).
+    PrintNl,
 
     // --- control flow ---
     Label(String),

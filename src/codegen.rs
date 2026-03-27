@@ -13,7 +13,11 @@ pub fn emit_arm64(ir: &IrProgram) -> String {
     let needs_printf = ir.instrs.iter().any(|i| {
         matches!(
             i,
-            Instr::PrintInt(_) | Instr::PrintBool(_) | Instr::PrintChar(_)
+            Instr::PrintInt(_)
+            | Instr::PrintBool(_)
+            | Instr::PrintChar(_)
+            | Instr::PrintCharOnly(_)
+            | Instr::PrintNl
         )
     });
 
@@ -60,6 +64,10 @@ pub fn emit_arm64(ir: &IrProgram) -> String {
         writeln!(o, "    .asciz \"false\\n\"").unwrap();
         writeln!(o, "L_pr_char_fmt:").unwrap();
         writeln!(o, "    .asciz \"%c\\n\"").unwrap();
+        writeln!(o, "L_pr_char_only:").unwrap();
+        writeln!(o, "    .asciz \"%c\"").unwrap();
+        writeln!(o, "L_pr_nl_only:").unwrap();
+        writeln!(o, "    .asciz \"\\n\"").unwrap();
     }
 
     o
@@ -123,6 +131,7 @@ fn collect_slots(instrs: &[Instr]) -> Vec<String> {
                 note(v);
                 note(s);
             }
+            Instr::StoreVarImm(v, _) => note(v),
             Instr::LoadIndex(d, first, idx, _) => {
                 note(d);
                 note(first);
@@ -134,7 +143,10 @@ fn collect_slots(instrs: &[Instr]) -> Vec<String> {
                 note(src);
             }
             Instr::JumpIfZero(c, _) => note(c),
-            Instr::PrintInt(t) | Instr::PrintBool(t) | Instr::PrintChar(t) => note(t),
+            Instr::PrintInt(t) | Instr::PrintBool(t) | Instr::PrintChar(t) | Instr::PrintCharOnly(t) => {
+                note(t);
+            }
+            Instr::PrintNl => {}
             Instr::Label(_) | Instr::Jump(_) => {}
         }
     }
@@ -274,6 +286,10 @@ fn emit_instr(
             ldr_stack(o, "x8", oa(src));
             str_stack(o, "x8", oa(var));
         }
+        Instr::StoreVarImm(var, imm) => {
+            mov_i64(o, "x8", *imm);
+            str_stack(o, "x8", oa(var));
+        }
         Instr::LoadIndex(dst, first_slot, idx, _len) => {
             ldr_stack(o, "x10", oa(idx));
             add_sp_offset(o, "x9", oa(first_slot));
@@ -333,6 +349,24 @@ fn emit_instr(
             writeln!(o, "    str x8, [sp]").unwrap();
             writeln!(o, "    adrp x0, L_pr_char_fmt@PAGE").unwrap();
             writeln!(o, "    add x0, x0, L_pr_char_fmt@PAGEOFF").unwrap();
+            writeln!(o, "    bl _printf").unwrap();
+            writeln!(o, "    add sp, sp, #32").unwrap();
+        }
+        Instr::PrintCharOnly(temp) => {
+            assert!(needs_printf);
+            ldr_stack(o, "x8", oa(temp));
+            writeln!(o, "    sub sp, sp, #32").unwrap();
+            writeln!(o, "    str x8, [sp]").unwrap();
+            writeln!(o, "    adrp x0, L_pr_char_only@PAGE").unwrap();
+            writeln!(o, "    add x0, x0, L_pr_char_only@PAGEOFF").unwrap();
+            writeln!(o, "    bl _printf").unwrap();
+            writeln!(o, "    add sp, sp, #32").unwrap();
+        }
+        Instr::PrintNl => {
+            assert!(needs_printf);
+            writeln!(o, "    sub sp, sp, #32").unwrap();
+            writeln!(o, "    adrp x0, L_pr_nl_only@PAGE").unwrap();
+            writeln!(o, "    add x0, x0, L_pr_nl_only@PAGEOFF").unwrap();
             writeln!(o, "    bl _printf").unwrap();
             writeln!(o, "    add sp, sp, #32").unwrap();
         }

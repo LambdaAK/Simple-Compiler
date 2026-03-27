@@ -1,9 +1,3 @@
-int arr[1000];
+char s[] = "Hello  World!";
 
-for (int i = 0; i < 1000; i++) {
-    arr[i] = 2 * i;
-}
-
-for (int i = 0; i < 1000; i++) {
-    print_int(arr[i]);
-}
+print_string(s);

@@ -15,12 +15,15 @@ pub enum Token {
     KwPrintBool,
     KwChar,
     KwPrintChar,
+    KwPrintString,
 
     // --- identifiers & literals ---
     Ident(String),
     IntLit(i64),
     /// One ASCII / byte (`'x'`, `'\n'`, …).
     CharLit(u8),
+    /// UTF-8 / bytes inside `"..."` (no implicit NUL; lowering adds `\0` for C strings).
+    StringLit(Vec<u8>),
 
     // --- operators ---
     /// `+`
@@ -58,6 +61,7 @@ pub enum Token {
 
     // --- punctuation ---
     Semicolon,
+    Comma,
     LParen,
     RParen,
     LBrace,
@@ -87,6 +91,7 @@ impl Token {
             "print_bool" => Token::KwPrintBool,
             "char" => Token::KwChar,
             "print_char" => Token::KwPrintChar,
+            "print_string" => Token::KwPrintString,
             _ => return None,
         };
         Some(tok)

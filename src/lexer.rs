@@ -92,6 +92,10 @@ pub fn lex(source: &str) -> Result<Vec<Token>, LexError> {
                 out.push(Token::Semicolon);
                 i += 1;
             }
+            b',' => {
+                out.push(Token::Comma);
+                i += 1;
+            }
             b'=' => {
                 if bytes.get(i + 1) == Some(&b'=') {
                     out.push(Token::EqEq);
@@ -186,6 +190,54 @@ pub fn lex(source: &str) -> Result<Vec<Token>, LexError> {
                 }
                 i += 1;
                 out.push(Token::CharLit(byte));
+            }
+            b'"' => {
+                i += 1;
+                let mut s = Vec::<u8>::new();
+                loop {
+                    if i >= bytes.len() {
+                        return Err(LexError::new(
+                            i.saturating_sub(1),
+                            "unclosed string literal",
+                        ));
+                    }
+                    if bytes[i] == b'"' {
+                        i += 1;
+                        break;
+                    }
+                    if bytes[i] == b'\\' {
+                        i += 1;
+                        if i >= bytes.len() {
+                            return Err(LexError::new(
+                                i.saturating_sub(1),
+                                "unclosed string literal after `\\`",
+                            ));
+                        }
+                        let b = match bytes[i] {
+                            b'n' => b'\n',
+                            b't' => b'\t',
+                            b'r' => b'\r',
+                            b'0' => 0,
+                            b'\\' => b'\\',
+                            b'"' => b'"',
+                            c => {
+                                return Err(LexError::new(
+                                    i,
+                                    format!("unknown escape `\\{}` in string literal", c as char),
+                                ));
+                            }
+                        };
+                        s.push(b);
+                        i += 1;
+                        continue;
+                    }
+                    if bytes[i] == b'\n' {
+                        return Err(LexError::new(i, "newline in string literal"));
+                    }
+                    s.push(bytes[i]);
+                    i += 1;
+                }
+                out.push(Token::StringLit(s));
             }
             b'0'..=b'9' => {
                 let start = i;

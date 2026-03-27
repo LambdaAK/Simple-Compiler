@@ -86,10 +86,67 @@ impl LowerCtx {
             );
         for i in 0..len {
             let slot = format!("v{}", start + i);
-            let z = self.fresh_temp();
-            self.ir.push(Instr::Const(z.clone(), 0));
-            self.ir.push(Instr::StoreVar(slot, z));
+            self.ir.push(Instr::StoreVarImm(slot, 0));
         }
+    }
+
+    /// `char s[] = "...";` — **bytes** includes the trailing **`0`** (NUL).
+    fn declare_char_array_from_bytes(&mut self, source_name: &str, bytes: &[u8]) {
+        let len = bytes.len();
+        let start = self.slot_id;
+        self.slot_id += len;
+        let first_slot = format!("v{}", start);
+        self.scopes
+            .last_mut()
+            .expect("lower: always at least one scope")
+            .insert(
+                source_name.to_string(),
+                Binding::Array {
+                    first_slot: first_slot.clone(),
+                    elem: Ty::Char,
+                    len,
+                },
+            );
+        for (i, b) in bytes.iter().enumerate() {
+            self
+                .ir
+                .push(Instr::StoreVarImm(format!("v{}", start + i), i64::from(*b)));
+        }
+    }
+
+    /// Anonymous NUL-terminated bytes on the stack (for string literals). Returns first slot id.
+    fn emit_stack_c_string(&mut self, bytes_including_nul: &[u8]) -> String {
+        let start = self.slot_id;
+        let len = bytes_including_nul.len();
+        self.slot_id += len;
+        let first = format!("v{}", start);
+        for (i, b) in bytes_including_nul.iter().enumerate() {
+            self.ir.push(Instr::StoreVarImm(
+                format!("v{}", start + i),
+                i64::from(*b),
+            ));
+        }
+        first
+    }
+
+    /// `print_string`: one stack word per character; walk until NUL (then one `\\n`).
+    fn lower_print_string_chars(&mut self, first_slot: &str, len: usize) {
+        let end_l = self.fresh_label("print_string_end");
+        for i in 0..len {
+            let idx_t = self.fresh_temp();
+            self.ir.push(Instr::Const(idx_t.clone(), i as i64));
+            let ch_t = self.fresh_temp();
+            self.ir.push(Instr::LoadIndex(
+                ch_t.clone(),
+                first_slot.to_string(),
+                idx_t,
+                len,
+            ));
+            self.ir.push(Instr::JumpIfZero(ch_t.clone(), end_l.clone()));
+            self.ir.push(Instr::PrintCharOnly(ch_t));
+        }
+        self.ir.push(Instr::Label(end_l));
+        self.ir.push(Instr::PrintNl);
     }
 
     fn resolve(&self, source_name: &str) -> Result<Binding, LowerError> {
@@ -141,11 +198,49 @@ impl LowerCtx {
         Ok(())
     }
 
+    fn check_array_literal_elem(&self, elem_ty: Ty, e: &Expr) -> Result<(), LowerError> {
+        match elem_ty {
+            Ty::Bool => {
+                Self::expect_ty(self.expr_ty(e)?, Ty::Bool, "`bool[]` element")?;
+            }
+            Ty::Int => {
+                let t = self.expr_ty(e)?;
+                if t != Ty::Int && t != Ty::Char {
+                    return Err(LowerError::TypeMismatch(format!(
+                        "`int[]` element expects int or char, got {t:?}"
+                    )));
+                }
+            }
+            Ty::Char => match e {
+                Expr::IntLit(n) => {
+                    if *n < 0 || *n > 255 {
+                        return Err(LowerError::TypeMismatch(format!(
+                            "`char[]` element from integer literal must be 0..=255, got {}",
+                            *n
+                        )));
+                    }
+                }
+                _ => {
+                    let t = self.expr_ty(e)?;
+                    if t != Ty::Int && t != Ty::Char {
+                        return Err(LowerError::TypeMismatch(format!(
+                            "`char[]` element expects int or char, got {t:?}"
+                        )));
+                    }
+                }
+            },
+        }
+        Ok(())
+    }
+
     fn expr_ty(&self, expr: &Expr) -> Result<Ty, LowerError> {
         match expr {
             Expr::IntLit(_) => Ok(Ty::Int),
             Expr::BoolLit(_) => Ok(Ty::Bool),
             Expr::CharLit(_) => Ok(Ty::Char),
+            Expr::StringLit(_) => Err(LowerError::TypeMismatch(
+                "string literal cannot be used as a scalar expression".into(),
+            )),
             Expr::Var(name) => match self.resolve(name)? {
                 Binding::Scalar { ty, .. } => Ok(ty),
                 Binding::Array { .. } => Err(LowerError::TypeMismatch(format!(
@@ -239,6 +334,10 @@ impl LowerCtx {
                     .push(Instr::Const(dst.clone(), i64::from(*b)));
                 Ok(dst)
             }
+            Expr::StringLit(_) => Err(LowerError::TypeMismatch(
+                "string literal must be used only as `print_string(\"...\")` or `char s[] = \"...\";`"
+                    .into(),
+            )),
             Expr::Var(name) => {
                 let (slot, _) = self.resolve_scalar(name)?;
                 let dst = self.fresh_temp();
@@ -392,6 +491,55 @@ impl LowerCtx {
             Stmt::ArrayDecl { name, elem_ty, len } => {
                 self.declare_array(name, *elem_ty, *len);
             }
+            Stmt::CharArrayFromString { name, bytes } => {
+                self.declare_char_array_from_bytes(name, bytes);
+            }
+            Stmt::ArrayFromExprs {
+                name,
+                elem_ty,
+                elements,
+            } => {
+                if elements.is_empty() {
+                    return Err(LowerError::TypeMismatch(
+                        "array initializer list must not be empty".into(),
+                    ));
+                }
+                for e in elements {
+                    self.check_array_literal_elem(*elem_ty, e)?;
+                }
+                let len = elements.len();
+                let start = self.slot_id;
+                self.slot_id += len;
+                let first_slot = format!("v{}", start);
+                self.scopes
+                    .last_mut()
+                    .expect("lower: always at least one scope")
+                    .insert(
+                        name.clone(),
+                        Binding::Array {
+                            first_slot: first_slot.clone(),
+                            elem: *elem_ty,
+                            len,
+                        },
+                    );
+                let mut temps = Vec::new();
+                for e in elements {
+                    temps.push(self.lower_expr(e)?);
+                }
+                for (i, tmp) in temps.into_iter().enumerate() {
+                    let slot = format!("v{}", start + i);
+                    let val = if *elem_ty == Ty::Char {
+                        let c255 = self.fresh_temp();
+                        self.ir.push(Instr::Const(c255.clone(), 255));
+                        let masked = self.fresh_temp();
+                        self.ir.push(Instr::And(masked.clone(), tmp, c255));
+                        masked
+                    } else {
+                        tmp
+                    };
+                    self.ir.push(Instr::StoreVar(slot, val));
+                }
+            }
             Stmt::Assign { name, value } => {
                 let (slot, var_ty) = self.resolve_scalar(name)?;
                 match var_ty {
@@ -478,6 +626,31 @@ impl LowerCtx {
                 Self::expect_ty(self.expr_ty(arg)?, Ty::Char, "`print_char` argument")?;
                 let tmp = self.lower_expr(arg)?;
                 self.ir.push(Instr::PrintChar(tmp));
+            }
+            Stmt::PrintString { arg } => {
+                let (first_slot, len) = match arg {
+                    Expr::StringLit(raw) => {
+                        let mut v = raw.clone();
+                        v.push(0);
+                        let first = self.emit_stack_c_string(&v);
+                        (first, v.len())
+                    }
+                    Expr::Var(name) => {
+                        let (first, elem, len) = self.resolve_array(name)?;
+                        if elem != Ty::Char {
+                            return Err(LowerError::TypeMismatch(
+                                "`print_string` expects `char[]`, got non-char array".into(),
+                            ));
+                        }
+                        (first, len)
+                    }
+                    _ => {
+                        return Err(LowerError::TypeMismatch(
+                            "`print_string` expects `\"...\"` or a `char[]` variable".into(),
+                        ));
+                    }
+                };
+                self.lower_print_string_chars(&first_slot, len);
             }
             Stmt::Block(stmts) => {
                 self.push_scope();
@@ -725,5 +898,18 @@ mod tests {
                 .any(|i| matches!(i, Instr::StoreIndex(_, _, _, _))),
             "{ir:?}"
         );
+    }
+
+    #[test]
+    fn print_string_uses_char_loop() {
+        let p = parse_program(r#"print_string("ab");"#).unwrap();
+        let ir = lower_program(&p).unwrap();
+        assert!(
+            ir.instrs
+                .iter()
+                .any(|i| matches!(i, Instr::PrintCharOnly(_))),
+            "{ir:?}"
+        );
+        assert!(ir.instrs.iter().any(|i| matches!(i, Instr::PrintNl)), "{ir:?}");
     }
 }
