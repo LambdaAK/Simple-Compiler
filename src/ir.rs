@@ -43,8 +43,10 @@ pub struct IrModule {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Instr {
-    /// At function entry: copy incoming **AAPCS** argument register `x{0 + reg_idx}` into `slot`.
+    /// At function entry: copy incoming **AAPCS** argument register `x{0 + reg_idx}` into `slot` (**first 8** argument words).
     RecvParam(Temp, u8),
+    /// Incoming argument word **past the registers**: copy from **`[fp, #16 + 8 * stack_word]`** into `slot` (matches our prologue: first stack word is **`fp+16`**).
+    RecvParamStack(Temp, u32),
 
     /// `dst = imm`
     Const(Temp, i64),

@@ -5,8 +5,8 @@ use std::collections::{HashMap, HashSet};
 use crate::ast::{BinOp, Expr, Item, Program, RetTy, Stmt, Ty, UnaryOp};
 use crate::ir::{Instr, IrFunction, IrModule, IrProgram};
 
-/// Max total argument **words** (each `int`/`bool`/`char` is 1 word; structs count their fields).
-const MAX_ARG_WORDS: usize = 8;
+/// First **eight** argument words use **`x0`–`x7`**; further words use the **stack** (see [`Instr::RecvParamStack`](crate::ir::Instr::RecvParamStack)).
+const REG_ARG_WORDS: usize = 8;
 
 /// `print_*` and user functions share this name list for resolution.
 pub const BUILTIN_PRINT_INT: &str = "print_int";
@@ -101,7 +101,6 @@ impl<'a> LowerCtx<'a> {
             .iter()
             .map(|(_, t)| ty_size_words(t, struct_layouts))
             .sum::<Result<usize, LowerError>>()?;
-        let mut reg_cursor: u8 = 0;
         let mut slot_cursor: usize = 0;
         let mut cx = Self {
             ir: IrProgram::new(),
@@ -114,13 +113,9 @@ impl<'a> LowerCtx<'a> {
             label_prefix: name.to_string(),
             current_ret: Some(ret),
         };
+        let mut arg_word: usize = 0;
         for (pname, ty) in params {
             let words = ty_size_words(ty, struct_layouts)?;
-            if reg_cursor as usize + words > MAX_ARG_WORDS {
-                return Err(LowerError::TypeMismatch(format!(
-                    "function `{name}`: arguments use more than {MAX_ARG_WORDS} words"
-                )));
-            }
             match ty {
                 Ty::Int | Ty::Bool | Ty::Char => {
                     let slot = format!("v{}", slot_cursor);
@@ -134,8 +129,16 @@ impl<'a> LowerCtx<'a> {
                                 ty: ty.clone(),
                             },
                         );
-                    cx.ir.push(Instr::RecvParam(slot, reg_cursor));
-                    reg_cursor += 1;
+                    if arg_word < REG_ARG_WORDS {
+                        cx.ir
+                            .push(Instr::RecvParam(slot, arg_word.try_into().unwrap()));
+                    } else {
+                        cx.ir.push(Instr::RecvParamStack(
+                            slot,
+                            (arg_word - REG_ARG_WORDS).try_into().unwrap(),
+                        ));
+                    }
+                    arg_word += 1;
                     slot_cursor += 1;
                 }
                 Ty::Array(..) => {
@@ -157,12 +160,19 @@ impl<'a> LowerCtx<'a> {
                             },
                         );
                     for j in 0..words {
-                        cx.ir.push(Instr::RecvParam(
-                            format!("v{}", slot_cursor + j),
-                            reg_cursor + j as u8,
-                        ));
+                        let wslot = format!("v{}", slot_cursor + j);
+                        let g = arg_word + j;
+                        if g < REG_ARG_WORDS {
+                            cx.ir
+                                .push(Instr::RecvParam(wslot, g.try_into().unwrap()));
+                        } else {
+                            cx.ir.push(Instr::RecvParamStack(
+                                wslot,
+                                (g - REG_ARG_WORDS).try_into().unwrap(),
+                            ));
+                        }
                     }
-                    reg_cursor += words as u8;
+                    arg_word += words;
                     slot_cursor += words;
                 }
             }
@@ -1639,7 +1649,7 @@ fn fn_sig_from_ast(params: &[(String, Ty)], ret: RetTy) -> FnSig {
 /// Build the user function table (each forward declaration must match its definition).
 pub fn build_fn_table(
     program: &Program,
-    struct_layouts: &HashMap<String, StructLayout>,
+    _struct_layouts: &HashMap<String, StructLayout>,
 ) -> Result<HashMap<String, FnSig>, LowerError> {
     let mut protos: HashMap<String, FnSig> = HashMap::new();
     let mut defs: HashMap<String, FnSig> = HashMap::new();
@@ -1650,15 +1660,6 @@ pub fn build_fn_table(
                 if let RetTy::Scalar(Ty::Struct(tn)) = ret {
                     return Err(LowerError::StructReturnNotSupported(format!(
                         "function `{name}` cannot return `struct {tn}`"
-                    )));
-                }
-                let arg_words: usize = params
-                    .iter()
-                    .map(|(_, t)| ty_size_words(t, struct_layouts))
-                    .sum::<Result<usize, LowerError>>()?;
-                if arg_words > MAX_ARG_WORDS {
-                    return Err(LowerError::TypeMismatch(format!(
-                        "function `{name}`: at most {MAX_ARG_WORDS} argument words"
                     )));
                 }
                 let sig = fn_sig_from_ast(params, ret.clone());
@@ -1674,15 +1675,6 @@ pub fn build_fn_table(
                 if let RetTy::Scalar(Ty::Struct(tn)) = ret {
                     return Err(LowerError::StructReturnNotSupported(format!(
                         "function `{name}` cannot return `struct {tn}`"
-                    )));
-                }
-                let arg_words: usize = params
-                    .iter()
-                    .map(|(_, t)| ty_size_words(t, struct_layouts))
-                    .sum::<Result<usize, LowerError>>()?;
-                if arg_words > MAX_ARG_WORDS {
-                    return Err(LowerError::TypeMismatch(format!(
-                        "function `{name}`: at most {MAX_ARG_WORDS} argument words"
                     )));
                 }
                 let sig = fn_sig_from_ast(params, ret.clone());
@@ -1966,6 +1958,25 @@ mod tests {
         assert!(
             ir.main.instrs.iter().any(|i| matches!(i, Instr::LoadIndex(_, _, _, 3))),
             "{ir:?}"
+        );
+    }
+
+    #[test]
+    fn stack_args_when_struct_exceeds_eight_words() {
+        let p = parse_program(
+            "struct Big { int a; int b; int c; int d; int e; int f; int g; int h; int i; };\n\
+             int tail(struct Big b) { return b.i; }\n\
+             struct Big x;\n\
+             x.i = 99;\n\
+             print_int(tail(x));",
+        )
+        .unwrap();
+        let ir = lower_program(&p).unwrap();
+        let f = &ir.functions[0];
+        assert!(
+            f.instrs.iter().any(|i| matches!(i, Instr::RecvParamStack(s, 0) if s == "v8")),
+            "9th word should load from stack: {:?}",
+            f.instrs
         );
     }
 }

@@ -125,6 +125,16 @@ fn emit_sub_sp(o: &mut String, mut total: usize) {
     }
 }
 
+/// `add sp, sp, #N` — undo [`emit_sub_sp`].
+fn emit_add_sp(o: &mut String, mut total: usize) {
+    const MAX_IMM: usize = 4095;
+    while total > 0 {
+        let chunk = total.min(MAX_IMM);
+        writeln!(o, "    add sp, sp, #{}", chunk).unwrap();
+        total -= chunk;
+    }
+}
+
 /// Deterministic slot order: first time a name appears in a full IR walk.
 fn collect_slots(instrs: &[Instr]) -> Vec<String> {
     let mut seen = HashMap::<String, ()>::new();
@@ -139,7 +149,7 @@ fn collect_slots(instrs: &[Instr]) -> Vec<String> {
 
     for instr in instrs {
         match instr {
-            Instr::RecvParam(d, _) => note(d),
+            Instr::RecvParam(d, _) | Instr::RecvParamStack(d, _) => note(d),
             Instr::Const(d, _) => note(d),
             Instr::Add(d, a, b) | Instr::Sub(d, a, b) | Instr::Mul(d, a, b) | Instr::Div(d, a, b) => {
                 note(d);
@@ -261,6 +271,17 @@ fn emit_instr(
         Instr::RecvParam(slot, reg_idx) => {
             let reg = ["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"][*reg_idx as usize];
             str_stack(o, reg, oa(slot));
+        }
+        Instr::RecvParamStack(slot, stack_word) => {
+            let off = 16usize + (*stack_word as usize) * 8;
+            if off <= 4095 {
+                writeln!(o, "    ldr x8, [x29, #{}]", off).unwrap();
+            } else {
+                mov_i64(o, "x9", off as i64);
+                writeln!(o, "    add x9, x29, x9").unwrap();
+                writeln!(o, "    ldr x8, [x9]").unwrap();
+            }
+            str_stack(o, "x8", oa(slot));
         }
         Instr::Const(dst, imm) => {
             mov_i64(o, "x8", *imm);
@@ -429,11 +450,46 @@ fn emit_instr(
             args,
         } => {
             const ARGREG: [&str; 8] = ["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"];
-            for (i, a) in args.iter().enumerate() {
-                assert!(i < 8, "at most 8 arguments");
-                ldr_stack(o, ARGREG[i], oa(a));
+            let n_reg = args.len().min(8);
+            let n_stack = args.len().saturating_sub(8);
+            let stack_bytes = align16(n_stack * 8);
+            if n_stack > 0 {
+                emit_sub_sp(o, stack_bytes);
+                for k in 0..n_stack {
+                    let src_off = oa(&args[8 + k]);
+                    let dst_off = k * 8;
+                    if src_off + stack_bytes <= 4095 {
+                        writeln!(
+                            o,
+                            "    ldr x9, [sp, #{}]",
+                            src_off + stack_bytes
+                        )
+                        .unwrap();
+                    } else {
+                        add_sp_offset(o, "x10", src_off + stack_bytes);
+                        writeln!(o, "    ldr x9, [x10]").unwrap();
+                    }
+                    writeln!(o, "    str x9, [sp, #{}]", dst_off).unwrap();
+                }
+            }
+            for i in 0..n_reg {
+                if n_stack > 0 {
+                    let so = oa(&args[i]);
+                    if so + stack_bytes <= 4095 {
+                        writeln!(o, "    ldr {}, [sp, #{}]", ARGREG[i], so + stack_bytes)
+                            .unwrap();
+                    } else {
+                        add_sp_offset(o, "x10", so + stack_bytes);
+                        writeln!(o, "    ldr {}, [x10]", ARGREG[i]).unwrap();
+                    }
+                } else {
+                    ldr_stack(o, ARGREG[i], oa(&args[i]));
+                }
             }
             writeln!(o, "    bl _{}", callee).unwrap();
+            if n_stack > 0 {
+                emit_add_sp(o, stack_bytes);
+            }
             if let Some(d) = dst {
                 str_stack(o, "x0", oa(d));
             }
