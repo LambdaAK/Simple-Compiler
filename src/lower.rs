@@ -1,11 +1,12 @@
 //! Lower [`crate::ast::Program`] to [`crate::ir::IrModule`] (three-address code, `_main` + user functions).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::ast::{BinOp, Expr, Item, Program, RetTy, Stmt, Ty, UnaryOp};
 use crate::ir::{Instr, IrFunction, IrModule, IrProgram};
 
-const MAX_FUNC_PARAMS: usize = 8;
+/// Max total argument **words** (each `int`/`bool`/`char` is 1 word; structs count their fields).
+const MAX_ARG_WORDS: usize = 8;
 
 /// `print_*` and user functions share this name list for resolution.
 pub const BUILTIN_PRINT_INT: &str = "print_int";
@@ -30,6 +31,16 @@ pub enum LowerError {
     ReturnOutsideFunction,
     BadReturn(String),
     ParameterShadowsFunction(String),
+    DuplicateStruct(String),
+    UnknownStruct(String),
+    RecursiveStruct(String),
+    StructReturnNotSupported(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct StructLayout {
+    pub size_words: usize,
+    pub fields: Vec<(String, Ty, usize)>,
 }
 
 #[derive(Debug, Clone)]
@@ -41,6 +52,13 @@ enum Binding {
         elem: Ty,
         len: usize,
     },
+    /// Struct instance: `first_slot` is `v{n}` for word 0 of the object.
+    Struct {
+        tag: String,
+        first_slot: String,
+        #[allow(dead_code)]
+        size_words: usize,
+    },
 }
 
 struct LowerCtx<'a> {
@@ -50,6 +68,7 @@ struct LowerCtx<'a> {
     label_id: usize,
     slot_id: usize,
     fn_sigs: &'a HashMap<String, FnSig>,
+    struct_layouts: &'a HashMap<String, StructLayout>,
     /// Prefix so labels are unique across functions (`main`, user name).
     label_prefix: String,
     /// `None` while lowering top-level script (`return` forbidden).
@@ -57,7 +76,7 @@ struct LowerCtx<'a> {
 }
 
 impl<'a> LowerCtx<'a> {
-    fn new_main(fn_sigs: &'a HashMap<String, FnSig>) -> Self {
+    fn new_main(fn_sigs: &'a HashMap<String, FnSig>, struct_layouts: &'a HashMap<String, StructLayout>) -> Self {
         Self {
             ir: IrProgram::new(),
             scopes: vec![HashMap::new()],
@@ -65,6 +84,7 @@ impl<'a> LowerCtx<'a> {
             label_id: 0,
             slot_id: 0,
             fn_sigs,
+            struct_layouts,
             label_prefix: "main".into(),
             current_ret: None,
         }
@@ -72,39 +92,77 @@ impl<'a> LowerCtx<'a> {
 
     fn new_function(
         fn_sigs: &'a HashMap<String, FnSig>,
+        struct_layouts: &'a HashMap<String, StructLayout>,
         name: &str,
         ret: RetTy,
         params: &[(String, Ty)],
-    ) -> Self {
-        let n = params.len();
+    ) -> Result<Self, LowerError> {
+        let total_param_words: usize = params
+            .iter()
+            .map(|(_, t)| ty_size_words(t, struct_layouts))
+            .sum::<Result<usize, LowerError>>()?;
+        let mut reg_cursor: u8 = 0;
+        let mut slot_cursor: usize = 0;
         let mut cx = Self {
             ir: IrProgram::new(),
             scopes: vec![HashMap::new()],
             temp_id: 0,
             label_id: 0,
-            slot_id: n,
+            slot_id: total_param_words,
             fn_sigs,
+            struct_layouts,
             label_prefix: name.to_string(),
             current_ret: Some(ret),
         };
-        for (i, (pname, ty)) in params.iter().enumerate() {
-            let slot = format!("v{}", i);
-            cx.scopes
-                .last_mut()
-                .expect("lower: root scope")
-                .insert(
-                    pname.clone(),
-                    Binding::Scalar {
-                        slot: slot.clone(),
-                        ty: *ty,
-                    },
-                );
-            cx.ir.push(Instr::RecvParam(
-                slot,
-                u8::try_from(i).expect("parameter count checked at build_fn_table"),
-            ));
+        for (pname, ty) in params {
+            let words = ty_size_words(ty, struct_layouts)?;
+            if reg_cursor as usize + words > MAX_ARG_WORDS {
+                return Err(LowerError::TypeMismatch(format!(
+                    "function `{name}`: arguments use more than {MAX_ARG_WORDS} words"
+                )));
+            }
+            match ty {
+                Ty::Int | Ty::Bool | Ty::Char => {
+                    let slot = format!("v{}", slot_cursor);
+                    cx.scopes
+                        .last_mut()
+                        .expect("lower: root scope")
+                        .insert(
+                            pname.clone(),
+                            Binding::Scalar {
+                                slot: slot.clone(),
+                                ty: ty.clone(),
+                            },
+                        );
+                    cx.ir.push(Instr::RecvParam(slot, reg_cursor));
+                    reg_cursor += 1;
+                    slot_cursor += 1;
+                }
+                Ty::Struct(tag) => {
+                    let slot = format!("v{}", slot_cursor);
+                    cx.scopes
+                        .last_mut()
+                        .expect("lower: root scope")
+                        .insert(
+                            pname.clone(),
+                            Binding::Struct {
+                                tag: tag.clone(),
+                                first_slot: slot.clone(),
+                                size_words: words,
+                            },
+                        );
+                    for j in 0..words {
+                        cx.ir.push(Instr::RecvParam(
+                            format!("v{}", slot_cursor + j),
+                            reg_cursor + j as u8,
+                        ));
+                    }
+                    reg_cursor += words as u8;
+                    slot_cursor += words;
+                }
+            }
         }
-        cx
+        Ok(cx)
     }
 
     fn finish_function(&mut self, ret: RetTy) -> Result<(), LowerError> {
@@ -140,7 +198,42 @@ impl<'a> LowerCtx<'a> {
         l
     }
 
+    fn declare_struct(&mut self, source_name: &str, tag: &str) -> Result<(), LowerError> {
+        if self.fn_sigs.contains_key(source_name) {
+            return Err(LowerError::ParameterShadowsFunction(source_name.to_string()));
+        }
+        let layout = self
+            .struct_layouts
+            .get(tag)
+            .ok_or_else(|| LowerError::UnknownStruct(tag.to_string()))?;
+        let start = self.slot_id;
+        let n = layout.size_words;
+        self.slot_id += n;
+        for i in 0..n {
+            self
+                .ir
+                .push(Instr::StoreVarImm(format!("v{}", start + i), 0));
+        }
+        self.scopes
+            .last_mut()
+            .expect("lower: always at least one scope")
+            .insert(
+                source_name.to_string(),
+                Binding::Struct {
+                    tag: tag.to_string(),
+                    first_slot: format!("v{}", start),
+                    size_words: n,
+                },
+            );
+        Ok(())
+    }
+
     fn declare(&mut self, source_name: &str, ty: Ty) -> Result<String, LowerError> {
+        if matches!(ty, Ty::Struct(_)) {
+            return Err(LowerError::TypeMismatch(
+                "internal: use `declare_struct` for struct variables".into(),
+            ));
+        }
         if self.fn_sigs.contains_key(source_name) {
             return Err(LowerError::ParameterShadowsFunction(source_name.to_string()));
         }
@@ -160,6 +253,11 @@ impl<'a> LowerCtx<'a> {
     }
 
     fn declare_array(&mut self, source_name: &str, elem: Ty, len: usize) -> Result<(), LowerError> {
+        if matches!(elem, Ty::Struct(_)) {
+            return Err(LowerError::TypeMismatch(
+                "arrays of `struct` are not supported".into(),
+            ));
+        }
         if self.fn_sigs.contains_key(source_name) {
             return Err(LowerError::ParameterShadowsFunction(source_name.to_string()));
         }
@@ -260,15 +358,6 @@ impl<'a> LowerCtx<'a> {
         Err(LowerError::UndefinedVariable(source_name.to_string()))
     }
 
-    fn resolve_scalar(&self, source_name: &str) -> Result<(String, Ty), LowerError> {
-        match self.resolve(source_name)? {
-            Binding::Scalar { slot, ty } => Ok((slot, ty)),
-            Binding::Array { .. } => Err(LowerError::TypeMismatch(format!(
-                "`{source_name}` is an array; use `{source_name}[i]`"
-            ))),
-        }
-    }
-
     fn resolve_array(&self, source_name: &str) -> Result<(String, Ty, usize), LowerError> {
         match self.resolve(source_name)? {
             Binding::Array {
@@ -276,9 +365,84 @@ impl<'a> LowerCtx<'a> {
                 elem,
                 len,
             } => Ok((first_slot, elem, len)),
-            Binding::Scalar { .. } => Err(LowerError::TypeMismatch(format!(
+            Binding::Scalar { .. } | Binding::Struct { .. } => Err(LowerError::TypeMismatch(format!(
                 "`{source_name}` is not an array"
             ))),
+        }
+    }
+
+    fn is_struct_ty(&self, ty: &Ty) -> bool {
+        matches!(ty, Ty::Struct(_))
+    }
+
+    fn struct_field_lookup(
+        &self,
+        tag: &str,
+        field: &str,
+    ) -> Result<(Ty, usize), LowerError> {
+        let layout = self
+            .struct_layouts
+            .get(tag)
+            .ok_or_else(|| LowerError::UnknownStruct(tag.to_string()))?;
+        for (fname, fty, off) in &layout.fields {
+            if fname == field {
+                return Ok((fty.clone(), *off));
+            }
+        }
+        Err(LowerError::TypeMismatch(format!(
+            "struct `{tag}` has no field `{field}`"
+        )))
+    }
+
+    /// Address of a (possibly nested) member: first slot index + complete field type.
+    fn member_object_and_ty(&self, e: &Expr) -> Result<(usize, Ty), LowerError> {
+        match e {
+            Expr::Var(name) => match self.resolve(name)? {
+                Binding::Struct {
+                    first_slot, tag, ..
+                } => Ok((slot_index(&first_slot)?, Ty::Struct(tag.clone()))),
+                _ => Err(LowerError::TypeMismatch(
+                    "`.` requires a struct on the left".into(),
+                )),
+            },
+            Expr::Member { base, field } => {
+                let (bidx, bty) = self.member_object_and_ty(base)?;
+                let Ty::Struct(tag) = bty else {
+                    return Err(LowerError::TypeMismatch(
+                        "`.` requires struct on the left".into(),
+                    ));
+                };
+                let (fty, off) = self.struct_field_lookup(&tag, field)?;
+                Ok((bidx + off, fty))
+            }
+            _ => Err(LowerError::TypeMismatch(
+                "`.` expects variable or member chain".into(),
+            )),
+        }
+    }
+
+    fn lvalue_slot_index_and_ty(&self, e: &Expr) -> Result<(usize, Ty), LowerError> {
+        match e {
+            Expr::Var(name) => Ok(match self.resolve(name)? {
+                Binding::Scalar { slot, ty } => (slot_index(&slot)?, ty),
+                Binding::Struct { .. } => {
+                    return Err(LowerError::TypeMismatch(
+                        "assign or copy a whole struct with `a = b`".into(),
+                    ));
+                }
+                Binding::Array { .. } => {
+                    return Err(LowerError::TypeMismatch(
+                        "use indexed assignment for arrays".into(),
+                    ));
+                }
+            }),
+            Expr::Member { .. } => self.member_object_and_ty(e),
+            Expr::Index { .. } => Err(LowerError::TypeMismatch(
+                "internal: index assign uses StoreIndex".into(),
+            )),
+            _ => Err(LowerError::TypeMismatch(
+                "expression is not a valid assignment target".into(),
+            )),
         }
     }
 
@@ -312,6 +476,11 @@ impl<'a> LowerCtx<'a> {
 
     fn check_array_literal_elem(&self, elem_ty: Ty, e: &Expr) -> Result<(), LowerError> {
         match elem_ty {
+            Ty::Struct(_) => {
+                return Err(LowerError::TypeMismatch(
+                    "arrays of `struct` are not supported".into(),
+                ));
+            }
             Ty::Bool => {
                 Self::expect_ty(self.expr_ty(e)?, Ty::Bool, "`bool[]` element")?;
             }
@@ -355,32 +524,51 @@ impl<'a> LowerCtx<'a> {
             )),
             Expr::Var(name) => match self.resolve(name)? {
                 Binding::Scalar { ty, .. } => Ok(ty),
+                Binding::Struct { tag, .. } => Ok(Ty::Struct(tag.clone())),
                 Binding::Array { .. } => Err(LowerError::TypeMismatch(format!(
                     "array `{name}` cannot be used as a scalar value"
                 ))),
             },
+            Expr::Member { base, field } => {
+                let bty = self.expr_ty(base)?;
+                let Ty::Struct(tag) = bty else {
+                    return Err(LowerError::TypeMismatch(
+                        "`.` requires struct on the left".into(),
+                    ));
+                };
+                let (fty, _) = self.struct_field_lookup(&tag, field)?;
+                Ok(fty)
+            }
             Expr::Index { base, index } => {
                 let (_, elem, _) = self.resolve_array(base)?;
                 let it = self.expr_ty(index)?;
                 let ok = |t: Ty| t == Ty::Int || t == Ty::Char;
-                if !ok(it) {
+                if !ok(it.clone()) {
                     return Err(LowerError::TypeMismatch(format!(
                         "array index must be int or char, got {it:?}"
                     )));
                 }
                 Ok(elem)
             }
-            Expr::PostInc(name) => {
-                let (_, var_ty) = self.resolve_scalar(name)?;
-                match var_ty {
+            Expr::PostInc(inner) => {
+                let t = self.expr_ty(inner)?;
+                match t {
                     Ty::Bool => Err(LowerError::TypeMismatch(
                         "postfix `++` expects int or char variable".into(),
+                    )),
+                    Ty::Struct(_) => Err(LowerError::TypeMismatch(
+                        "postfix `++` cannot apply to struct".into(),
                     )),
                     Ty::Int | Ty::Char => Ok(Ty::Int),
                 }
             }
             Expr::Unary(UnaryOp::Neg, e) => {
                 let t = self.expr_ty(e)?;
+                if matches!(t, Ty::Struct(_)) {
+                    return Err(LowerError::TypeMismatch(
+                        "unary `-` expects int or char operand".into(),
+                    ));
+                }
                 if t == Ty::Int || t == Ty::Char {
                     Ok(Ty::Int)
                 } else {
@@ -390,7 +578,13 @@ impl<'a> LowerCtx<'a> {
                 }
             }
             Expr::Unary(UnaryOp::Not, e) => {
-                Self::expect_ty(self.expr_ty(e)?, Ty::Bool, "unary `!` expects bool operand")?;
+                let t = self.expr_ty(e)?;
+                if matches!(t, Ty::Struct(_)) {
+                    return Err(LowerError::TypeMismatch(
+                        "unary `!` expects bool operand".into(),
+                    ));
+                }
+                Self::expect_ty(t, Ty::Bool, "unary `!` expects bool operand")?;
                 Ok(Ty::Bool)
             }
             Expr::Call { name, args } => {
@@ -410,15 +604,15 @@ impl<'a> LowerCtx<'a> {
                         args.len()
                     )));
                 }
-                for (a, &pty) in args.iter().zip(&sig.params) {
+                for (a, pty) in args.iter().zip(&sig.params) {
                     let at = self.expr_ty(a)?;
-                    Self::expect_ty(at, pty, &format!("argument to `{name}`"))?;
+                    Self::expect_ty(at, pty.clone(), &format!("argument to `{name}`"))?;
                 }
-                match sig.ret {
+                match &sig.ret {
                     RetTy::Void => Err(LowerError::TypeMismatch(format!(
                         "function `{name}` returns void and cannot be used as an expression"
                     ))),
-                    RetTy::Scalar(t) => Ok(t),
+                    RetTy::Scalar(t) => Ok(t.clone()),
                 }
             }
             Expr::Binary(op, l, r) => {
@@ -426,8 +620,13 @@ impl<'a> LowerCtx<'a> {
                 let rt = self.expr_ty(r)?;
                 match op {
                     BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => {
+                        if matches!(lt, Ty::Struct(_)) || matches!(rt, Ty::Struct(_)) {
+                            return Err(LowerError::TypeMismatch(format!(
+                                "`{op:?}` expects int or char operands, got {lt:?} and {rt:?}"
+                            )));
+                        }
                         let ok = |t: Ty| t == Ty::Int || t == Ty::Char;
-                        if !ok(lt) || !ok(rt) {
+                        if !ok(lt.clone()) || !ok(rt.clone()) {
                             return Err(LowerError::TypeMismatch(format!(
                                 "`{op:?}` expects int or char operands, got {lt:?} and {rt:?}"
                             )));
@@ -435,6 +634,11 @@ impl<'a> LowerCtx<'a> {
                         Ok(Ty::Int)
                     }
                     BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                        if matches!(lt, Ty::Struct(_)) || matches!(rt, Ty::Struct(_)) {
+                            return Err(LowerError::TypeMismatch(
+                                "cannot compare structs".into(),
+                            ));
+                        }
                         let bool_cmp = lt == Ty::Bool && rt == Ty::Bool;
                         let num_cmp = (lt == Ty::Int || lt == Ty::Char)
                             && (rt == Ty::Int || rt == Ty::Char);
@@ -479,9 +683,31 @@ impl<'a> LowerCtx<'a> {
                     .into(),
             )),
             Expr::Var(name) => {
-                let (slot, _) = self.resolve_scalar(name)?;
+                match self.resolve(name)? {
+                    Binding::Scalar { slot, .. } => {
+                        let dst = self.fresh_temp();
+                        self.ir.push(Instr::LoadVar(dst.clone(), slot));
+                        Ok(dst)
+                    }
+                    Binding::Struct { .. } => Err(LowerError::TypeMismatch(
+                        "struct cannot be used as a scalar expression".into(),
+                    )),
+                    Binding::Array { .. } => Err(LowerError::TypeMismatch(
+                        "array cannot be used as a scalar expression".into(),
+                    )),
+                }
+            }
+            Expr::Member { .. } => {
+                let (idx, fty) = self.member_object_and_ty(expr)?;
+                if self.is_struct_ty(&fty) {
+                    return Err(LowerError::TypeMismatch(
+                        "use struct only in assignment, call argument, or member chain".into(),
+                    ));
+                }
                 let dst = self.fresh_temp();
-                self.ir.push(Instr::LoadVar(dst.clone(), slot));
+                self
+                    .ir
+                    .push(Instr::LoadVar(dst.clone(), format!("v{}", idx)));
                 Ok(dst)
             }
             Expr::Index { base, index } => {
@@ -493,7 +719,7 @@ impl<'a> LowerCtx<'a> {
                     .push(Instr::LoadIndex(dst.clone(), first, idx_t, len));
                 Ok(dst)
             }
-            Expr::PostInc(name) => self.lower_post_inc(name),
+            Expr::PostInc(inner) => self.lower_post_inc_expr(inner),
             Expr::Unary(op, inner) => {
                 let src = self.lower_expr(inner)?;
                 let dst = self.fresh_temp();
@@ -535,11 +761,58 @@ impl<'a> LowerCtx<'a> {
     }
 
     /// Postfix `i++`: load old, add 1, store (mask **`char`** to 0–255), return old value (**`int`**).
-    fn lower_post_inc(&mut self, name: &str) -> Result<String, LowerError> {
-        let (slot, var_ty) = self.resolve_scalar(name)?;
+    fn lower_post_inc_expr(&mut self, inner: &Expr) -> Result<String, LowerError> {
+        match inner {
+            Expr::Index { base, index } => {
+                let (first, var_ty, len) = self.resolve_array(base)?;
+                if matches!(var_ty, Ty::Struct(_)) {
+                    return Err(LowerError::TypeMismatch(
+                        "arrays of struct not supported".into(),
+                    ));
+                }
+                match var_ty {
+                    Ty::Bool => Err(LowerError::TypeMismatch(
+                        "postfix `++` expects int or char variable".into(),
+                    )),
+                    Ty::Int | Ty::Char => {
+                        let idx_t = self.lower_expr(index)?;
+                        let old = self.fresh_temp();
+                        self.ir.push(Instr::LoadIndex(
+                            old.clone(),
+                            first.clone(),
+                            idx_t.clone(),
+                            len,
+                        ));
+                        let one = self.fresh_temp();
+                        self.ir.push(Instr::Const(one.clone(), 1));
+                        let new = self.fresh_temp();
+                        self.ir.push(Instr::Add(new.clone(), old.clone(), one));
+                        let stored = if var_ty == Ty::Char {
+                            let c255 = self.fresh_temp();
+                            self.ir.push(Instr::Const(c255.clone(), 255));
+                            let masked = self.fresh_temp();
+                            self.ir.push(Instr::And(masked.clone(), new, c255));
+                            masked
+                        } else {
+                            new
+                        };
+                        self
+                            .ir
+                            .push(Instr::StoreIndex(first, idx_t, stored, len));
+                        Ok(old)
+                    }
+                    Ty::Struct(_) => unreachable!(),
+                }
+            }
+            assign_target => {
+        let (idx, var_ty) = self.lvalue_slot_index_and_ty(assign_target)?;
+        let slot = format!("v{}", idx);
         match var_ty {
             Ty::Bool => Err(LowerError::TypeMismatch(
                 "postfix `++` expects int or char variable".into(),
+            )),
+            Ty::Struct(_) => Err(LowerError::TypeMismatch(
+                "postfix `++` on struct member must be scalar".into(),
             )),
             Ty::Int => {
                 let old = self.fresh_temp();
@@ -566,18 +839,65 @@ impl<'a> LowerCtx<'a> {
                 Ok(old)
             }
         }
+            }
+        }
     }
 
-    fn lower_add_assign(&mut self, name: &str, rhs: &Expr) -> Result<(), LowerError> {
-        let (slot, var_ty) = self.resolve_scalar(name)?;
+    fn lower_add_assign(&mut self, target: &Expr, rhs: &Expr) -> Result<(), LowerError> {
+        match target {
+            Expr::Index { base, index } => {
+                let (first, var_ty, len) = self.resolve_array(base)?;
+                if matches!(var_ty, Ty::Struct(_)) {
+                    return Err(LowerError::TypeMismatch(
+                        "arrays of struct not supported".into(),
+                    ));
+                }
+                let rt = self.expr_ty(rhs)?;
+                let ok = |t: Ty| t == Ty::Int || t == Ty::Char;
+                if !ok(rt.clone()) {
+                    return Err(LowerError::TypeMismatch(format!(
+                        "`+=` to array element expects int or char RHS, got {rt:?}"
+                    )));
+                }
+                let idx_t = self.lower_expr(index)?;
+                let old = self.fresh_temp();
+                self.ir.push(Instr::LoadIndex(
+                    old.clone(),
+                    first.clone(),
+                    idx_t.clone(),
+                    len,
+                ));
+                let r = self.lower_expr(rhs)?;
+                let new = self.fresh_temp();
+                self.ir.push(Instr::Add(new.clone(), old, r));
+                let stored = if var_ty == Ty::Char {
+                    let c255 = self.fresh_temp();
+                    self.ir.push(Instr::Const(c255.clone(), 255));
+                    let masked = self.fresh_temp();
+                    self.ir.push(Instr::And(masked.clone(), new, c255));
+                    masked
+                } else {
+                    new
+                };
+                self
+                    .ir
+                    .push(Instr::StoreIndex(first, idx_t, stored, len));
+                Ok(())
+            }
+            _ => {
+        let (idx, var_ty) = self.lvalue_slot_index_and_ty(target)?;
+        let slot = format!("v{}", idx);
         match var_ty {
             Ty::Bool => Err(LowerError::TypeMismatch(
                 "`+=` expects int or char variable".into(),
             )),
+            Ty::Struct(_) => Err(LowerError::TypeMismatch(
+                "`+=` cannot apply to a struct".into(),
+            )),
             Ty::Int => {
                 let rt = self.expr_ty(rhs)?;
                 let ok = |t: Ty| t == Ty::Int || t == Ty::Char;
-                if !ok(rt) {
+                if !ok(rt.clone()) {
                     return Err(LowerError::TypeMismatch(format!(
                         "`+=` to int expects int or char RHS, got {rt:?}"
                     )));
@@ -593,7 +913,7 @@ impl<'a> LowerCtx<'a> {
             Ty::Char => {
                 let rt = self.expr_ty(rhs)?;
                 let ok = |t: Ty| t == Ty::Int || t == Ty::Char;
-                if !ok(rt) {
+                if !ok(rt.clone()) {
                     return Err(LowerError::TypeMismatch(format!(
                         "`+=` to char expects int or char RHS, got {rt:?}"
                     )));
@@ -610,6 +930,29 @@ impl<'a> LowerCtx<'a> {
                 self.ir.push(Instr::StoreVar(slot, masked));
                 Ok(())
             }
+        }
+            }
+        }
+    }
+
+    fn whole_struct_value(&self, e: &Expr) -> Result<(usize, Ty), LowerError> {
+        let ty = self.expr_ty(e)?;
+        if !self.is_struct_ty(&ty) {
+            return Err(LowerError::TypeMismatch("expected struct value".into()));
+        }
+        match e {
+            Expr::Var(n) => {
+                let Binding::Struct { first_slot, .. } = self.resolve(n)? else {
+                    return Err(LowerError::TypeMismatch(
+                        "expected struct variable".into(),
+                    ));
+                };
+                Ok((slot_index(&first_slot)?, ty))
+            }
+            Expr::Member { .. } => self.member_object_and_ty(e),
+            _ => Err(LowerError::TypeMismatch(
+                "struct copy requires variable or member on each side".into(),
+            )),
         }
     }
 
@@ -715,12 +1058,28 @@ impl<'a> LowerCtx<'a> {
                 args.len()
             )));
         }
-        for (a, &pty) in args.iter().zip(&sig.params) {
+        for (a, pty) in args.iter().zip(&sig.params) {
             let at = self.expr_ty(a)?;
-            Self::expect_ty(at, pty, &format!("argument to `{name}`"))?;
+            Self::expect_ty(at, pty.clone(), &format!("argument to `{name}`"))?;
         }
-        let arg_temps: Result<Vec<_>, _> = args.iter().map(|a| self.lower_expr(a)).collect();
-        let arg_temps = arg_temps?;
+        let mut arg_temps = Vec::new();
+        for a in args {
+            match self.expr_ty(a)? {
+                Ty::Struct(_) => {
+                    let (s0, st) = self.whole_struct_value(a)?;
+                    let n = ty_size_words(&st, self.struct_layouts)?;
+                    for i in 0..n {
+                        let t = self.fresh_temp();
+                        self.ir.push(Instr::LoadVar(
+                            t.clone(),
+                            format!("v{}", s0 + i),
+                        ));
+                        arg_temps.push(t);
+                    }
+                }
+                _ => arg_temps.push(self.lower_expr(a)?),
+            }
+        }
         match sig.ret {
             RetTy::Void => {
                 if need_value {
@@ -763,26 +1122,57 @@ impl<'a> LowerCtx<'a> {
     fn lower_stmt(&mut self, stmt: &Stmt) -> Result<(), LowerError> {
         match stmt {
             Stmt::VarDecl { name, ty, init } => {
-                match (*ty, init) {
-                    (Ty::Char, Expr::IntLit(n)) => {
-                        if *n < 0 || *n > 255 {
-                            return Err(LowerError::TypeMismatch(format!(
-                                "`char` initializer from integer must be 0..=255, got {}",
-                                *n
-                            )));
+                if let Ty::Struct(ref tag) = ty {
+                    match init {
+                        None => {
+                            self.declare_struct(name, tag)?;
+                        }
+                        Some(init_e) => {
+                            let it = self.expr_ty(init_e)?;
+                            Self::expect_ty(it, ty.clone(), "struct initializer vs declared type")?;
+                            self.declare_struct(name, tag)?;
+                            let (dst0, _) = self.whole_struct_value(&Expr::Var(name.clone()))?;
+                            let (src0, st) = self.whole_struct_value(init_e)?;
+                            let n = ty_size_words(&st, self.struct_layouts)?;
+                            for i in 0..n {
+                                let t = self.fresh_temp();
+                                self.ir.push(Instr::LoadVar(
+                                    t.clone(),
+                                    format!("v{}", src0 + i),
+                                ));
+                                self
+                                    .ir
+                                    .push(Instr::StoreVar(format!("v{}", dst0 + i), t));
+                            }
                         }
                     }
-                    _ => {
-                        let init_ty = self.expr_ty(init)?;
-                        Self::expect_ty(init_ty, *ty, "variable initializer vs declared type")?;
+                } else {
+                    let init_e = init.as_ref().ok_or_else(|| {
+                        LowerError::TypeMismatch(
+                            "scalar variables require an initializer".into(),
+                        )
+                    })?;
+                    match init_e {
+                        Expr::IntLit(n) if matches!(ty, Ty::Char) => {
+                            if *n < 0 || *n > 255 {
+                                return Err(LowerError::TypeMismatch(format!(
+                                    "`char` initializer from integer must be 0..=255, got {}",
+                                    *n
+                                )));
+                            }
+                        }
+                        _ => {
+                            let init_ty = self.expr_ty(init_e)?;
+                            Self::expect_ty(init_ty, ty.clone(), "variable initializer vs declared type")?;
+                        }
                     }
+                    let slot = self.declare(name, ty.clone())?;
+                    let tmp = self.lower_expr(init_e)?;
+                    self.ir.push(Instr::StoreVar(slot, tmp));
                 }
-                let slot = self.declare(name, *ty)?;
-                let tmp = self.lower_expr(init)?;
-                self.ir.push(Instr::StoreVar(slot, tmp));
             }
             Stmt::ArrayDecl { name, elem_ty, len } => {
-                self.declare_array(name, *elem_ty, *len)?;
+                self.declare_array(name, elem_ty.clone(), *len)?;
             }
             Stmt::CharArrayFromString { name, bytes } => {
                 self.declare_char_array_from_bytes(name, bytes)?;
@@ -801,7 +1191,7 @@ impl<'a> LowerCtx<'a> {
                     ));
                 }
                 for e in elements {
-                    self.check_array_literal_elem(*elem_ty, e)?;
+                    self.check_array_literal_elem(elem_ty.clone(), e)?;
                 }
                 let len = elements.len();
                 let start = self.slot_id;
@@ -814,7 +1204,7 @@ impl<'a> LowerCtx<'a> {
                         name.clone(),
                         Binding::Array {
                             first_slot: first_slot.clone(),
-                            elem: *elem_ty,
+                            elem: elem_ty.clone(),
                             len,
                         },
                     );
@@ -836,77 +1226,118 @@ impl<'a> LowerCtx<'a> {
                     self.ir.push(Instr::StoreVar(slot, val));
                 }
             }
-            Stmt::Assign { name, value } => {
-                let (slot, var_ty) = self.resolve_scalar(name)?;
-                match var_ty {
-                    Ty::Char => match value {
-                        Expr::IntLit(n) => {
-                            if *n < 0 || *n > 255 {
-                                return Err(LowerError::TypeMismatch(format!(
-                                    "assign to `char` from integer must be 0..=255, got {}",
-                                    *n
-                                )));
+            Stmt::Assign { target, value } => {
+                match target {
+                    Expr::Index { base, index } => {
+                        let (first, elem_ty, len) = self.resolve_array(base)?;
+                        match elem_ty {
+                            Ty::Char => match value {
+                                Expr::IntLit(n) => {
+                                    if *n < 0 || *n > 255 {
+                                        return Err(LowerError::TypeMismatch(format!(
+                                            "assign to `char` from integer must be 0..=255, got {}",
+                                            *n
+                                        )));
+                                    }
+                                }
+                                _ => {
+                                    let val_ty = self.expr_ty(value)?;
+                                    Self::expect_ty(
+                                        val_ty,
+                                        Ty::Char,
+                                        "assignment to `char[]` element",
+                                    )?;
+                                }
+                            },
+                            _ => {
+                                let val_ty = self.expr_ty(value)?;
+                                Self::expect_ty(val_ty, elem_ty.clone(), "assignment to array element")?;
                             }
                         }
-                        _ => {
-                            let val_ty = self.expr_ty(value)?;
-                            Self::expect_ty(val_ty, Ty::Char, "assignment to `char`")?;
-                        }
-                    },
-                    _ => {
-                        let val_ty = self.expr_ty(value)?;
-                        Self::expect_ty(val_ty, var_ty, "assignment RHS vs variable type")?;
+                        let idx_t = self.lower_expr(index)?;
+                        let val_t = self.lower_expr(value)?;
+                        let stored = if elem_ty == Ty::Char {
+                            let c255 = self.fresh_temp();
+                            self.ir.push(Instr::Const(c255.clone(), 255));
+                            let masked = self.fresh_temp();
+                            self.ir.push(Instr::And(masked.clone(), val_t, c255));
+                            masked
+                        } else {
+                            val_t
+                        };
+                        self
+                            .ir
+                            .push(Instr::StoreIndex(first, idx_t, stored, len));
                     }
-                }
-                let tmp = self.lower_expr(value)?;
-                self.ir.push(Instr::StoreVar(slot, tmp));
-            }
-            Stmt::IndexAssign {
-                base,
-                index,
-                value,
-            } => {
-                let (first, elem_ty, len) = self.resolve_array(base)?;
-                match elem_ty {
-                    Ty::Char => match value {
-                        Expr::IntLit(n) => {
-                            if *n < 0 || *n > 255 {
-                                return Err(LowerError::TypeMismatch(format!(
-                                    "assign to `char` from integer must be 0..=255, got {}",
-                                    *n
-                                )));
+                    _ => {
+                        let lhs_ty = self.expr_ty(target)?;
+                        if self.is_struct_ty(&lhs_ty) {
+                            let rhs_ty = self.expr_ty(value)?;
+                            Self::expect_ty(
+                                rhs_ty,
+                                lhs_ty.clone(),
+                                "struct assignment RHS vs target type",
+                            )?;
+                            let (dst0, _) = self.whole_struct_value(target)?;
+                            let (src0, st) = self.whole_struct_value(value)?;
+                            let n = ty_size_words(&st, self.struct_layouts)?;
+                            for i in 0..n {
+                                let t = self.fresh_temp();
+                                self.ir.push(Instr::LoadVar(
+                                    t.clone(),
+                                    format!("v{}", src0 + i),
+                                ));
+                                self
+                                    .ir
+                                    .push(Instr::StoreVar(format!("v{}", dst0 + i), t));
                             }
+                        } else {
+                            let (idx, var_ty) = self.lvalue_slot_index_and_ty(target)?;
+                            let slot = format!("v{}", idx);
+                            match var_ty {
+                                Ty::Char => match value {
+                                    Expr::IntLit(n) => {
+                                        if *n < 0 || *n > 255 {
+                                            return Err(LowerError::TypeMismatch(format!(
+                                                "assign to `char` from integer must be 0..=255, got {}",
+                                                *n
+                                            )));
+                                        }
+                                    }
+                                    _ => {
+                                        let val_ty = self.expr_ty(value)?;
+                                        Self::expect_ty(val_ty, Ty::Char, "assignment to `char`")?;
+                                    }
+                                },
+                                _ => {
+                                    let val_ty = self.expr_ty(value)?;
+                                    Self::expect_ty(
+                                        val_ty,
+                                        var_ty.clone(),
+                                        "assignment RHS vs target type",
+                                    )?;
+                                }
+                            }
+                            let tmp = self.lower_expr(value)?;
+                            let stored = if var_ty == Ty::Char {
+                                let c255 = self.fresh_temp();
+                                self.ir.push(Instr::Const(c255.clone(), 255));
+                                let masked = self.fresh_temp();
+                                self.ir.push(Instr::And(masked.clone(), tmp, c255));
+                                masked
+                            } else {
+                                tmp
+                            };
+                            self.ir.push(Instr::StoreVar(slot, stored));
                         }
-                        _ => {
-                            let val_ty = self.expr_ty(value)?;
-                            Self::expect_ty(val_ty, Ty::Char, "assignment to `char[]` element")?;
-                        }
-                    },
-                    _ => {
-                        let val_ty = self.expr_ty(value)?;
-                        Self::expect_ty(val_ty, elem_ty, "assignment to array element")?;
                     }
                 }
-                let idx_t = self.lower_expr(index)?;
-                let val_t = self.lower_expr(value)?;
-                let stored = if elem_ty == Ty::Char {
-                    let c255 = self.fresh_temp();
-                    self.ir.push(Instr::Const(c255.clone(), 255));
-                    let masked = self.fresh_temp();
-                    self.ir.push(Instr::And(masked.clone(), val_t, c255));
-                    masked
-                } else {
-                    val_t
-                };
-                self
-                    .ir
-                    .push(Instr::StoreIndex(first, idx_t, stored, len));
             }
-            Stmt::AddAssign { name, rhs } => {
-                self.lower_add_assign(name, rhs)?;
+            Stmt::AddAssign { target, rhs } => {
+                self.lower_add_assign(target, rhs)?;
             }
-            Stmt::PostInc { name } => {
-                self.lower_post_inc(name)?;
+            Stmt::PostInc { target } => {
+                self.lower_post_inc_expr(target)?;
             }
             Stmt::Expr(Expr::Call { name, args }) => {
                 if Self::is_builtin(name) {
@@ -930,7 +1361,10 @@ impl<'a> LowerCtx<'a> {
                 ));
             }
             Stmt::Return(opt) => {
-                let ret_ty = self.current_ret.ok_or(LowerError::ReturnOutsideFunction)?;
+                let ret_ty = self
+                    .current_ret
+                    .clone()
+                    .ok_or(LowerError::ReturnOutsideFunction)?;
                 match (ret_ty, opt) {
                     (RetTy::Void, None) => {
                         self.ir.push(Instr::Ret(None));
@@ -1036,27 +1470,116 @@ impl<'a> LowerCtx<'a> {
     }
 }
 
+fn slot_index(slot: &str) -> Result<usize, LowerError> {
+    slot.strip_prefix('v')
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| LowerError::TypeMismatch(format!("internal: bad stack slot `{slot}`")))
+}
+
+fn ty_size_words(ty: &Ty, layouts: &HashMap<String, StructLayout>) -> Result<usize, LowerError> {
+    match ty {
+        Ty::Int | Ty::Bool | Ty::Char => Ok(1),
+        Ty::Struct(name) => layouts
+            .get(name)
+            .map(|l| l.size_words)
+            .ok_or_else(|| LowerError::UnknownStruct(name.clone())),
+    }
+}
+
+fn collect_struct_defs(program: &Program) -> Result<HashMap<String, Vec<(String, Ty)>>, LowerError> {
+    let mut m = HashMap::new();
+    for item in &program.items {
+        if let Item::StructDef { name, fields } = item {
+            if m.insert(name.clone(), fields.clone()).is_some() {
+                return Err(LowerError::DuplicateStruct(name.clone()));
+            }
+        }
+    }
+    Ok(m)
+}
+
+fn compute_struct_layouts(
+    defs: &HashMap<String, Vec<(String, Ty)>>,
+) -> Result<HashMap<String, StructLayout>, LowerError> {
+    let mut done = HashMap::new();
+    for name in defs.keys() {
+        layout_struct(name, defs, &mut HashSet::new(), &mut done)?;
+    }
+    Ok(done)
+}
+
+fn layout_struct(
+    name: &str,
+    defs: &HashMap<String, Vec<(String, Ty)>>,
+    visiting: &mut HashSet<String>,
+    done: &mut HashMap<String, StructLayout>,
+) -> Result<(), LowerError> {
+    if done.contains_key(name) {
+        return Ok(());
+    }
+    if !visiting.insert(name.to_string()) {
+        return Err(LowerError::RecursiveStruct(name.to_string()));
+    }
+    let fields_def = defs
+        .get(name)
+        .ok_or_else(|| LowerError::UnknownStruct(name.to_string()))?;
+    let mut offset = 0usize;
+    let mut fields = Vec::new();
+    for (fname, fty) in fields_def {
+        let sz = match fty {
+            Ty::Int | Ty::Bool | Ty::Char => 1usize,
+            Ty::Struct(inner) => {
+                layout_struct(inner, defs, visiting, done)?;
+                done.get(inner).unwrap().size_words
+            }
+        };
+        fields.push((fname.clone(), fty.clone(), offset));
+        offset += sz;
+    }
+    visiting.remove(name);
+    done.insert(
+        name.to_string(),
+        StructLayout {
+            size_words: offset,
+            fields,
+        },
+    );
+    Ok(())
+}
+
 fn fn_sig_from_ast(params: &[(String, Ty)], ret: RetTy) -> FnSig {
     FnSig {
-        params: params.iter().map(|(_, t)| *t).collect(),
+        params: params.iter().map(|(_, t)| t.clone()).collect(),
         ret,
     }
 }
 
 /// Build the user function table (each forward declaration must match its definition).
-pub fn build_fn_table(program: &Program) -> Result<HashMap<String, FnSig>, LowerError> {
+pub fn build_fn_table(
+    program: &Program,
+    struct_layouts: &HashMap<String, StructLayout>,
+) -> Result<HashMap<String, FnSig>, LowerError> {
     let mut protos: HashMap<String, FnSig> = HashMap::new();
     let mut defs: HashMap<String, FnSig> = HashMap::new();
 
     for item in &program.items {
         match item {
             Item::FnDecl { name, params, ret } => {
-                if params.len() > MAX_FUNC_PARAMS {
-                    return Err(LowerError::TypeMismatch(format!(
-                        "function `{name}`: at most {MAX_FUNC_PARAMS} parameters supported"
+                if let RetTy::Scalar(Ty::Struct(tn)) = ret {
+                    return Err(LowerError::StructReturnNotSupported(format!(
+                        "function `{name}` cannot return `struct {tn}`"
                     )));
                 }
-                let sig = fn_sig_from_ast(params, *ret);
+                let arg_words: usize = params
+                    .iter()
+                    .map(|(_, t)| ty_size_words(t, struct_layouts))
+                    .sum::<Result<usize, LowerError>>()?;
+                if arg_words > MAX_ARG_WORDS {
+                    return Err(LowerError::TypeMismatch(format!(
+                        "function `{name}`: at most {MAX_ARG_WORDS} argument words"
+                    )));
+                }
+                let sig = fn_sig_from_ast(params, ret.clone());
                 if let Some(old) = protos.get(name) {
                     if old != &sig {
                         return Err(LowerError::ConflictingPrototype(name.clone()));
@@ -1066,12 +1589,21 @@ pub fn build_fn_table(program: &Program) -> Result<HashMap<String, FnSig>, Lower
                 }
             }
             Item::FnDef { name, params, ret, .. } => {
-                if params.len() > MAX_FUNC_PARAMS {
-                    return Err(LowerError::TypeMismatch(format!(
-                        "function `{name}`: at most {MAX_FUNC_PARAMS} parameters supported"
+                if let RetTy::Scalar(Ty::Struct(tn)) = ret {
+                    return Err(LowerError::StructReturnNotSupported(format!(
+                        "function `{name}` cannot return `struct {tn}`"
                     )));
                 }
-                let sig = fn_sig_from_ast(params, *ret);
+                let arg_words: usize = params
+                    .iter()
+                    .map(|(_, t)| ty_size_words(t, struct_layouts))
+                    .sum::<Result<usize, LowerError>>()?;
+                if arg_words > MAX_ARG_WORDS {
+                    return Err(LowerError::TypeMismatch(format!(
+                        "function `{name}`: at most {MAX_ARG_WORDS} argument words"
+                    )));
+                }
+                let sig = fn_sig_from_ast(params, ret.clone());
                 if let Some(p) = protos.get(name) {
                     if p != &sig {
                         return Err(LowerError::ConflictingPrototype(name.clone()));
@@ -1081,7 +1613,7 @@ pub fn build_fn_table(program: &Program) -> Result<HashMap<String, FnSig>, Lower
                     return Err(LowerError::DuplicateFunction(name.clone()));
                 }
             }
-            Item::Stmt(_) => {}
+            Item::Stmt(_) | Item::StructDef { .. } => {}
         }
     }
 
@@ -1096,25 +1628,33 @@ pub fn build_fn_table(program: &Program) -> Result<HashMap<String, FnSig>, Lower
 
 /// Lower a full program to an [`IrModule`] (`_main` plus user functions).
 pub fn lower_program(program: &Program) -> Result<IrModule, LowerError> {
-    let fn_table = build_fn_table(program)?;
-    let mut main_cx = LowerCtx::new_main(&fn_table);
+    let raw_structs = collect_struct_defs(program)?;
+    let struct_layouts = compute_struct_layouts(&raw_structs)?;
+    let fn_table = build_fn_table(program, &struct_layouts)?;
+    let mut main_cx = LowerCtx::new_main(&fn_table, &struct_layouts);
     let mut functions = Vec::new();
 
     for item in &program.items {
         match item {
             Item::Stmt(stmt) => main_cx.lower_stmt(stmt)?,
-            Item::FnDecl { .. } => {}
+            Item::FnDecl { .. } | Item::StructDef { .. } => {}
             Item::FnDef {
                 name,
                 params,
                 ret,
                 body,
             } => {
-                let mut cx = LowerCtx::new_function(&fn_table, name, *ret, params);
+                let mut cx = LowerCtx::new_function(
+                    &fn_table,
+                    &struct_layouts,
+                    name,
+                    ret.clone(),
+                    params,
+                )?;
                 for st in body {
                     cx.lower_stmt(st)?;
                 }
-                cx.finish_function(*ret)?;
+                cx.finish_function(ret.clone())?;
                 functions.push(IrFunction {
                     name: name.clone(),
                     instrs: cx.ir.instrs,
@@ -1183,7 +1723,7 @@ mod tests {
             items: vec![Item::Stmt(Stmt::VarDecl {
                 name: "b".into(),
                 ty: Ty::Bool,
-                init: Expr::BoolLit(false),
+                init: Some(Expr::BoolLit(false)),
             })],
         };
         let ir = lower_program(&p).unwrap();

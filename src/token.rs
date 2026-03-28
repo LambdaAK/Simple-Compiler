@@ -14,6 +14,7 @@ pub enum Token {
     KwTrue,
     KwFalse,
     KwChar,
+    KwStruct,
 
     // --- identifiers & literals ---
     Ident(String),
@@ -56,6 +57,8 @@ pub enum Token {
     Bang,
     /// `=`
     Assign,
+    /// `.` (struct member)
+    Dot,
 
     // --- punctuation ---
     Semicolon,
@@ -88,6 +91,7 @@ impl Token {
             "true" => Token::KwTrue,
             "false" => Token::KwFalse,
             "char" => Token::KwChar,
+            "struct" => Token::KwStruct,
             _ => return None,
         };
         Some(tok)

@@ -119,18 +119,71 @@ L_fact_end_if_0:
     mov sp, x29
     ldp x29, x30, [sp], #16
     ret
+    .globl _norm
+    .p2align 2
+_norm:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+    sub sp, sp, #80
+    str x0, [sp, #0]
+    str x1, [sp, #8]
+    str x2, [sp, #16]
+    ldr x8, [sp, #0]
+    str x8, [sp, #24]
+    ldr x8, [sp, #0]
+    str x8, [sp, #32]
+    ldr x9, [sp, #24]
+    ldr x10, [sp, #32]
+    mul x8, x9, x10
+    str x8, [sp, #40]
+    ldr x8, [sp, #8]
+    str x8, [sp, #48]
+    ldr x8, [sp, #8]
+    str x8, [sp, #56]
+    ldr x9, [sp, #48]
+    ldr x10, [sp, #56]
+    mul x8, x9, x10
+    str x8, [sp, #64]
+    ldr x9, [sp, #40]
+    ldr x10, [sp, #64]
+    add x8, x9, x10
+    str x8, [sp, #72]
+    ldr x0, [sp, #72]
+    mov sp, x29
+    ldp x29, x30, [sp], #16
+    ret
     .globl _main
     .p2align 2
 _main:
     stp x29, x30, [sp, #-16]!
     mov x29, sp
-    sub sp, sp, #16
-    mov x8, #100
+    sub sp, sp, #80
+    mov x8, #0
     str x8, [sp, #0]
-    ldr x0, [sp, #0]
-    bl _fact
-    str x0, [sp, #8]
+    mov x8, #0
+    str x8, [sp, #8]
+    mov x8, #0
+    str x8, [sp, #16]
+    mov x8, #5
+    str x8, [sp, #24]
+    ldr x8, [sp, #24]
+    str x8, [sp, #0]
+    mov x8, #5
+    str x8, [sp, #32]
+    ldr x8, [sp, #32]
+    str x8, [sp, #8]
+    ldr x8, [sp, #0]
+    str x8, [sp, #40]
     ldr x8, [sp, #8]
+    str x8, [sp, #48]
+    ldr x8, [sp, #16]
+    str x8, [sp, #56]
+    ldr x0, [sp, #40]
+    ldr x1, [sp, #48]
+    ldr x2, [sp, #56]
+    bl _norm
+    str x0, [sp, #64]
+    ldr x8, [sp, #64]
     sub sp, sp, #32
     str x8, [sp]
     adrp x0, L_pr_int_fmt@PAGE

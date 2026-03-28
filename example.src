@@ -1,3 +1,9 @@
+struct Point {
+    int x;
+    int y;
+    int arr;
+};
+
 int fib(int n) {
     if (n == 1) {
         return 1;
@@ -18,4 +24,12 @@ int fact(int n) {
     return n * fact(n - 1);
 }
 
-print_int(fact(10));
+int norm(struct Point p) {
+    return p.x * p.x + p.y * p.y;
+}
+
+struct Point a;
+a.x = 5;
+a.y = 5;
+
+print_int(norm(a));

@@ -119,6 +119,62 @@ impl<'a> Parser<'a> {
                         .into()),
                 }
             }
+            Token::KwStruct => {
+                self.bump();
+                let tag = self.expect_ident()?;
+                match self.peek().clone() {
+                    Token::LBrace => {
+                        let fields = self.parse_struct_fields()?;
+                        self.consume(Token::Semicolon, "`;`")?;
+                        Ok(Item::StructDef { name: tag, fields })
+                    }
+                    Token::Ident(id) => {
+                        self.bump();
+                        if matches!(self.peek(), Token::LParen) {
+                            self.bump();
+                            let params = self.parse_param_list()?;
+                            self.consume(Token::RParen, "`)`")?;
+                            let ret = RetTy::Scalar(Ty::Struct(tag));
+                            match self.peek().clone() {
+                                Token::Semicolon => {
+                                    self.bump();
+                                    Ok(Item::FnDecl {
+                                        name: id,
+                                        params,
+                                        ret,
+                                    })
+                                }
+                                Token::LBrace => {
+                                    let body = self.parse_block()?;
+                                    Ok(Item::FnDef {
+                                        name: id,
+                                        params,
+                                        ret,
+                                        body,
+                                    })
+                                }
+                                other => Err(self
+                                    .error(format!(
+                                        "expected `;` or `{{` after function header, found `{other:?}`"
+                                    ))
+                                    .into()),
+                            }
+                        } else {
+                            self.consume(Token::Semicolon, "`;`")?;
+                            Ok(Item::Stmt(Stmt::VarDecl {
+                                name: id,
+                                ty: Ty::Struct(tag),
+                                init: None,
+                            }))
+                        }
+                    }
+                    other => Err(self
+                        .error(format!(
+                            "expected `{{` or identifier after `struct {tag}`, found `{other:?}`"
+                        ))
+                        .into()),
+                }
+            }
             Token::KwInt | Token::KwBool | Token::KwChar => {
                 let ty = match self.peek() {
                     Token::KwInt => Ty::Int,
@@ -167,7 +223,29 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_param_ty(&mut self) -> Result<Ty, FrontEndError> {
+    fn parse_struct_fields(&mut self) -> Result<Vec<(String, Ty)>, FrontEndError> {
+        self.consume(Token::LBrace, "`{`")?;
+        let mut fields = Vec::new();
+        if matches!(self.peek(), Token::RBrace) {
+            return Err(self.error("struct must have at least one member").into());
+        }
+        loop {
+            let ty = self.parse_type()?;
+            let fname = self.expect_ident()?;
+            self.consume(Token::Semicolon, "`;`")?;
+            fields.push((fname, ty));
+            match self.peek().clone() {
+                Token::RBrace => {
+                    self.bump();
+                    break;
+                }
+                _ => {}
+            }
+        }
+        Ok(fields)
+    }
+
+    fn parse_type(&mut self) -> Result<Ty, FrontEndError> {
         match self.peek().clone() {
             Token::KwInt => {
                 self.bump();
@@ -181,12 +259,20 @@ impl<'a> Parser<'a> {
                 self.bump();
                 Ok(Ty::Char)
             }
+            Token::KwStruct => {
+                self.bump();
+                Ok(Ty::Struct(self.expect_ident()?))
+            }
             other => Err(self
                 .error(format!(
-                    "parameter type must be `int`, `bool`, or `char`, found `{other:?}`"
+                    "expected type (`int`, `bool`, `char`, or `struct Tag`), found `{other:?}`"
                 ))
                 .into()),
         }
+    }
+
+    fn parse_param_ty(&mut self) -> Result<Ty, FrontEndError> {
+        self.parse_type()
     }
 
     fn parse_param_list(&mut self) -> Result<Vec<(String, Ty)>, FrontEndError> {
@@ -222,6 +308,17 @@ impl<'a> Parser<'a> {
 
     fn parse_stmt(&mut self) -> Result<Stmt, FrontEndError> {
         match self.peek().clone() {
+            Token::KwStruct => {
+                self.bump();
+                let tag = self.expect_ident()?;
+                let name = self.expect_ident()?;
+                self.consume(Token::Semicolon, "`;`")?;
+                Ok(Stmt::VarDecl {
+                    name,
+                    ty: Ty::Struct(tag),
+                    init: None,
+                })
+            }
             Token::KwInt => {
                 self.bump();
                 let s = self.parse_decl_tail_after_type(Ty::Int)?;
@@ -300,11 +397,6 @@ impl<'a> Parser<'a> {
                     self.consume(Token::RParen, "`)`")?;
                     self.consume(Token::Semicolon, "`;`")?;
                     Ok(Stmt::Expr(Expr::Call { name, args }))
-                } else if matches!(self.peek(), Token::LBracket) {
-                    self.bump();
-                    let index = self.parse_expr()?;
-                    self.consume(Token::RBracket, "`]`")?;
-                    self.parse_stmt_after_index_subscript(name, index, AfterIdentEnd::Semicolon)
                 } else {
                     self.parse_stmt_after_ident(name, AfterIdentEnd::Semicolon)
                 }
@@ -367,8 +459,20 @@ impl<'a> Parser<'a> {
         Ok(Stmt::VarDecl {
             name,
             ty: elem,
-            init,
+            init: Some(init),
         })
+    }
+
+    fn parse_member_chain(&mut self, mut e: Expr) -> Result<Expr, FrontEndError> {
+        while matches!(self.peek(), Token::Dot) {
+            self.bump();
+            let field = self.expect_ident()?;
+            e = Expr::Member {
+                base: Box::new(e),
+                field,
+            };
+        }
+        Ok(e)
     }
 
     fn parse_call_arg_list(&mut self) -> Result<Vec<Expr>, FrontEndError> {
@@ -446,8 +550,18 @@ impl<'a> Parser<'a> {
                 self.bump();
                 self.parse_decl_tail_after_type(Ty::Char)
             }
+            Token::KwStruct => {
+                self.bump();
+                let tag = self.expect_ident()?;
+                let name = self.expect_ident()?;
+                Ok(Stmt::VarDecl {
+                    name,
+                    ty: Ty::Struct(tag),
+                    init: None,
+                })
+            }
             other => Err(self
-                .error(format!("expected `int`, `bool`, or `char` in for-init, found `{other:?}`"))
+                .error(format!("expected `int`, `bool`, `char`, or `struct` in for-init, found `{other:?}`"))
                 .into()),
         }
     }
@@ -460,7 +574,7 @@ impl<'a> Parser<'a> {
         }
         if matches!(
             self.peek(),
-            Token::KwInt | Token::KwBool | Token::KwChar
+            Token::KwInt | Token::KwBool | Token::KwChar | Token::KwStruct
         ) {
             let stmt = self.parse_var_decl_stmt()?;
             self.consume(Token::Semicolon, "`;`")?;
@@ -468,14 +582,7 @@ impl<'a> Parser<'a> {
         }
         if let Token::Ident(name) = self.peek().clone() {
             self.bump();
-            let s = if matches!(self.peek(), Token::LBracket) {
-                self.bump();
-                let index = self.parse_expr()?;
-                self.consume(Token::RBracket, "`]`")?;
-                self.parse_stmt_after_index_subscript(name, index, AfterIdentEnd::Semicolon)?
-            } else {
-                self.parse_stmt_after_ident(name, AfterIdentEnd::Semicolon)?
-            };
+            let s = self.parse_stmt_after_ident(name, AfterIdentEnd::Semicolon)?;
             return Ok(Some(Box::new(s)));
         }
         Err(self
@@ -501,14 +608,7 @@ impl<'a> Parser<'a> {
         }
         if let Token::Ident(name) = self.peek().clone() {
             self.bump();
-            let s = if matches!(self.peek(), Token::LBracket) {
-                self.bump();
-                let index = self.parse_expr()?;
-                self.consume(Token::RBracket, "`]`")?;
-                self.parse_stmt_after_index_subscript(name, index, AfterIdentEnd::ForStep)?
-            } else {
-                self.parse_stmt_after_ident(name, AfterIdentEnd::ForStep)?
-            };
+            let s = self.parse_stmt_after_ident(name, AfterIdentEnd::ForStep)?;
             return Ok(Some(Box::new(s)));
         }
         Err(self
@@ -522,25 +622,36 @@ impl<'a> Parser<'a> {
         name: String,
         end: AfterIdentEnd,
     ) -> Result<Stmt, FrontEndError> {
+        let mut lhs = Expr::Var(name.clone());
+        if matches!(self.peek(), Token::LBracket) {
+            self.bump();
+            let index = self.parse_expr()?;
+            self.consume(Token::RBracket, "`]`")?;
+            lhs = Expr::Index {
+                base: name,
+                index: Box::new(index),
+            };
+        }
+        lhs = self.parse_member_chain(lhs)?;
         let stmt = match self.peek().clone() {
             Token::Assign => {
                 self.bump();
                 let value = self.parse_expr()?;
-                Stmt::Assign { name, value }
+                Stmt::Assign { target: lhs, value }
             }
             Token::PlusAssign => {
                 self.bump();
                 let rhs = self.parse_expr()?;
-                Stmt::AddAssign { name, rhs }
+                Stmt::AddAssign { target: lhs, rhs }
             }
             Token::PlusPlus => {
                 self.bump();
-                Stmt::PostInc { name }
+                Stmt::PostInc { target: lhs }
             }
             other => {
                 return Err(self
                     .error(format!(
-                        "expected `=`, `+=`, or `++` after identifier, found `{other:?}`"
+                        "expected `=`, `+=`, or `++` after lvalue, found `{other:?}`"
                     ))
                     .into());
             }
@@ -550,35 +661,6 @@ impl<'a> Parser<'a> {
             AfterIdentEnd::ForStep => {}
         }
         Ok(stmt)
-    }
-
-    fn parse_stmt_after_index_subscript(
-        &mut self,
-        base: String,
-        index: Expr,
-        end: AfterIdentEnd,
-    ) -> Result<Stmt, FrontEndError> {
-        match self.peek().clone() {
-            Token::Assign => {
-                self.bump();
-                let value = self.parse_expr()?;
-                let stmt = Stmt::IndexAssign {
-                    base,
-                    index,
-                    value,
-                };
-                match end {
-                    AfterIdentEnd::Semicolon => self.consume(Token::Semicolon, "`;`")?,
-                    AfterIdentEnd::ForStep => {}
-                }
-                Ok(stmt)
-            }
-            other => Err(self
-                .error(format!(
-                    "expected `=` after `a[i]`, found `{other:?}`"
-                ))
-                .into()),
-        }
     }
 
     fn parse_block(&mut self) -> Result<Vec<Stmt>, FrontEndError> {
@@ -733,18 +815,23 @@ impl<'a> Parser<'a> {
                 }
                 continue;
             }
+            if matches!(self.peek(), Token::Dot) {
+                self.bump();
+                let field = self.expect_ident()?;
+                e = Expr::Member {
+                    base: Box::new(e),
+                    field,
+                };
+                continue;
+            }
             if matches!(self.peek(), Token::PlusPlus) {
                 self.bump();
-                match e {
-                    Expr::Var(name) => {
-                        e = Expr::PostInc(name);
-                    }
-                    _ => {
-                        return Err(self
-                            .error("`++` postfix only applies to a variable")
-                            .into());
-                    }
+                if !matches!(e, Expr::Var(_) | Expr::Index { .. } | Expr::Member { .. }) {
+                    return Err(self
+                        .error("`++` postfix requires a variable, subscript, or member lvalue")
+                        .into());
                 }
+                e = Expr::PostInc(Box::new(e));
                 continue;
             }
             break;
@@ -840,7 +927,13 @@ mod tests {
     fn array_decl_and_index_expr() {
         let p = parse_program("int a[3]; a[1] = 42; print_int(a[1]);").unwrap();
         assert!(matches!(&p.items[0], Item::Stmt(Stmt::ArrayDecl { len: 3, .. })));
-        assert!(matches!(&p.items[1], Item::Stmt(Stmt::IndexAssign { .. })));
+        assert!(matches!(
+            &p.items[1],
+            Item::Stmt(Stmt::Assign {
+                target: Expr::Index { .. },
+                ..
+            })
+        ));
         assert!(matches!(
             &p.items[2],
             Item::Stmt(Stmt::Expr(Expr::Call { name, .. })) if name == "print_int"
@@ -924,7 +1017,7 @@ mod tests {
         let Item::Stmt(Stmt::VarDecl { init, .. }) = &p.items[1] else {
             panic!("expected var decl");
         };
-        assert!(matches!(init, Expr::PostInc(_)));
+        assert!(matches!(init, Some(Expr::PostInc(_))));
     }
 
     #[test]
@@ -940,8 +1033,8 @@ mod tests {
             panic!("expected var decl");
         };
         assert_eq!(
-            init,
-            &Expr::Binary(
+            init.as_ref(),
+            Some(&Expr::Binary(
                 BinOp::Add,
                 Box::new(Expr::IntLit(1)),
                 Box::new(Expr::Binary(
@@ -949,7 +1042,7 @@ mod tests {
                     Box::new(Expr::IntLit(2)),
                     Box::new(Expr::IntLit(3)),
                 )),
-            )
+            ))
         );
     }
 
@@ -965,7 +1058,7 @@ mod tests {
         match &p.items[0] {
             Item::Stmt(Stmt::VarDecl {
                 ty: Ty::Bool,
-                init: Expr::BoolLit(false),
+                init: Some(Expr::BoolLit(false)),
                 ..
             }) => {}
             other => panic!("unexpected: {other:?}"),
@@ -985,11 +1078,11 @@ mod tests {
             panic!("expected var decl");
         };
         assert!(matches!(
-            init,
-            Expr::Binary(BinOp::Or, _, _) | Expr::BoolLit(_)
+            init.as_ref(),
+            Some(Expr::Binary(BinOp::Or, _, _)) | Some(Expr::BoolLit(_))
         ));
         // (true || false) || false  →  outer Or
-        let Expr::Binary(BinOp::Or, l, _) = init else {
+        let Some(Expr::Binary(BinOp::Or, l, _)) = init.as_ref() else {
             panic!("expected or");
         };
         assert!(matches!(**l, Expr::Binary(BinOp::Or, _, _)));

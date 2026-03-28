@@ -96,6 +96,10 @@ pub fn lex(source: &str) -> Result<Vec<Token>, LexError> {
                 out.push(Token::Comma);
                 i += 1;
             }
+            b'.' => {
+                out.push(Token::Dot);
+                i += 1;
+            }
             b'=' => {
                 if bytes.get(i + 1) == Some(&b'=') {
                     out.push(Token::EqEq);
