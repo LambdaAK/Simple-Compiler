@@ -8,6 +8,8 @@
 //!
 //! **C strings on the stack:** `char s[] = "text";` — **`print_string("...")`** or **`print_string(s)`** prints characters then a newline.
 //!
+//! **`typedef`:** file-scope aliases, e.g. **`typedef int count_t;`**, **`typedef struct S S;`**, and array typedefs **`typedef int vec4[4];`** — names expand to canonical [`Ty`](Ty) in the AST (no separate alias type).
+//!
 //! **Structs:** `struct Point { int x; int y; };` then `struct Point p;` (**zero-initialized**), member access **`p.x`**, fields may be fixed arrays (`int xs[4];`), index with **`p.xs[i]`**. Assignment and scratch **`struct` arguments** (flattened to words). **Struct return types** are rejected for now.
 
 /// Value types in the surface language.

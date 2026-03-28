@@ -15,6 +15,7 @@ pub enum Token {
     KwFalse,
     KwChar,
     KwStruct,
+    KwTypedef,
 
     // --- identifiers & literals ---
     Ident(String),
@@ -92,6 +93,7 @@ impl Token {
             "false" => Token::KwFalse,
             "char" => Token::KwChar,
             "struct" => Token::KwStruct,
+            "typedef" => Token::KwTypedef,
             _ => return None,
         };
         Some(tok)

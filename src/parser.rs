@@ -1,5 +1,7 @@
 //! Recursive-descent parser for the README grammar (`program` → `stmt*` → `expr` with C-like precedence).
 
+use std::collections::HashMap;
+
 use crate::ast::{BinOp, Expr, Item, Program, RetTy, Stmt, Ty, UnaryOp};
 use crate::lexer::{lex, LexError};
 use crate::token::Token;
@@ -53,11 +55,21 @@ enum AfterIdentEnd {
 struct Parser<'a> {
     tokens: &'a [Token],
     pos: usize,
+    /// `typedef` aliases visible for the rest of the parse (file scope).
+    type_aliases: HashMap<String, Ty>,
 }
 
 impl<'a> Parser<'a> {
     fn new(tokens: &'a [Token]) -> Self {
-        Self { tokens, pos: 0 }
+        Self {
+            tokens,
+            pos: 0,
+            type_aliases: HashMap::new(),
+        }
+    }
+
+    fn peek_is_typedef_name(&self) -> bool {
+        matches!(self.peek(), Token::Ident(n) if self.type_aliases.contains_key(n))
     }
 
     fn peek(&self) -> &Token {
@@ -81,9 +93,76 @@ impl<'a> Parser<'a> {
     fn parse_program(&mut self) -> Result<Program, FrontEndError> {
         let mut items = Vec::new();
         while !matches!(self.peek(), Token::Eof) {
-            items.push(self.parse_item()?);
+            if matches!(self.peek(), Token::KwTypedef) {
+                self.parse_typedef()?;
+            } else {
+                items.push(self.parse_item()?);
+            }
         }
         Ok(Program { items })
+    }
+
+    /// `typedef <type> <name> ['[' n ']'] ;`
+    fn parse_typedef(&mut self) -> Result<(), FrontEndError> {
+        self.consume(Token::KwTypedef, "`typedef`")?;
+        let base = self.parse_type()?;
+        let alias = self.expect_ident()?;
+        let ty = self.maybe_array_suffix_after_declarator(base)?;
+        if self.type_aliases.insert(alias.clone(), ty).is_some() {
+            return Err(self
+                .error(format!("duplicate typedef `{alias}`"))
+                .into());
+        }
+        self.consume(Token::Semicolon, "`;`")?;
+        Ok(())
+    }
+
+    /// After a concrete or aliased type keyword / prefix: function vs global / block variable decl.
+    fn parse_item_after_ty(&mut self, ty: Ty) -> Result<Item, FrontEndError> {
+        let name = self.expect_ident()?;
+        if matches!(self.peek(), Token::LParen) {
+            self.bump();
+            let params = self.parse_param_list()?;
+            self.consume(Token::RParen, "`)`")?;
+            let ret = RetTy::Scalar(ty);
+            match self.peek().clone() {
+                Token::Semicolon => {
+                    self.bump();
+                    Ok(Item::FnDecl {
+                        name,
+                        params,
+                        ret,
+                    })
+                }
+                Token::LBrace => {
+                    let body = self.parse_block()?;
+                    Ok(Item::FnDef {
+                        name,
+                        params,
+                        ret,
+                        body,
+                    })
+                }
+                other => Err(self
+                    .error(format!(
+                        "expected `;` or `{{` after function header, found `{other:?}`"
+                    ))
+                    .into()),
+            }
+        } else {
+            if matches!(ty, Ty::Struct(_)) {
+                self.consume(Token::Semicolon, "`;`")?;
+                Ok(Item::Stmt(Stmt::VarDecl {
+                    name,
+                    ty,
+                    init: None,
+                }))
+            } else {
+                let stmt = self.decl_tail_for_var(ty, name)?;
+                self.consume(Token::Semicolon, "`;`")?;
+                Ok(Item::Stmt(stmt))
+            }
+        }
     }
 
     fn parse_item(&mut self) -> Result<Item, FrontEndError> {
@@ -175,49 +254,22 @@ impl<'a> Parser<'a> {
                         .into()),
                 }
             }
-            Token::KwInt | Token::KwBool | Token::KwChar => {
-                let ty = match self.peek() {
-                    Token::KwInt => Ty::Int,
-                    Token::KwBool => Ty::Bool,
-                    Token::KwChar => Ty::Char,
-                    _ => unreachable!(),
-                };
+            Token::KwInt => {
                 self.bump();
-                let name = self.expect_ident()?;
-                if matches!(self.peek(), Token::LParen) {
-                    self.bump();
-                    let params = self.parse_param_list()?;
-                    self.consume(Token::RParen, "`)`")?;
-                    let ret = RetTy::Scalar(ty);
-                    match self.peek().clone() {
-                        Token::Semicolon => {
-                            self.bump();
-                            Ok(Item::FnDecl {
-                                name,
-                                params,
-                                ret,
-                            })
-                        }
-                        Token::LBrace => {
-                            let body = self.parse_block()?;
-                            Ok(Item::FnDef {
-                                name,
-                                params,
-                                ret,
-                                body,
-                            })
-                        }
-                        other => Err(self
-                            .error(format!(
-                                "expected `;` or `{{` after function header, found `{other:?}`"
-                            ))
-                            .into()),
-                    }
-                } else {
-                    let stmt = self.decl_tail_for_var(ty, name)?;
-                    self.consume(Token::Semicolon, "`;`")?;
-                    Ok(Item::Stmt(stmt))
-                }
+                self.parse_item_after_ty(Ty::Int)
+            }
+            Token::KwBool => {
+                self.bump();
+                self.parse_item_after_ty(Ty::Bool)
+            }
+            Token::KwChar => {
+                self.bump();
+                self.parse_item_after_ty(Ty::Char)
+            }
+            Token::Ident(id) if self.type_aliases.contains_key(&id) => {
+                let ty = self.type_aliases.get(&id).expect("checked").clone();
+                self.bump();
+                self.parse_item_after_ty(ty)
             }
             _ => Ok(Item::Stmt(self.parse_stmt()?)),
         }
@@ -264,9 +316,21 @@ impl<'a> Parser<'a> {
                 self.bump();
                 Ok(Ty::Struct(self.expect_ident()?))
             }
+            Token::Ident(name) => {
+                if let Some(ty) = self.type_aliases.get(&name).cloned() {
+                    self.bump();
+                    Ok(ty)
+                } else {
+                    Err(self
+                        .error(format!(
+                            "`{name}` is not a type (unknown identifier in type position)"
+                        ))
+                        .into())
+                }
+            }
             other => Err(self
                 .error(format!(
-                    "expected type (`int`, `bool`, `char`, or `struct Tag`), found `{other:?}`"
+                    "expected type (`int`, `bool`, `char`, `struct Tag`, or typedef name), found `{other:?}`"
                 ))
                 .into()),
         }
@@ -420,6 +484,23 @@ impl<'a> Parser<'a> {
                 })
             }
             Token::LBrace => Ok(Stmt::Block(self.parse_block()?)),
+            Token::Ident(ref id) if self.type_aliases.contains_key(id) => {
+                let ty = self.type_aliases.get(id).expect("checked").clone();
+                self.bump();
+                let vname = self.expect_ident()?;
+                if matches!(ty, Ty::Struct(_)) {
+                    self.consume(Token::Semicolon, "`;`")?;
+                    Ok(Stmt::VarDecl {
+                        name: vname,
+                        ty,
+                        init: None,
+                    })
+                } else {
+                    let s = self.decl_tail_for_var(ty, vname)?;
+                    self.consume(Token::Semicolon, "`;`")?;
+                    Ok(s)
+                }
+            }
             Token::Ident(name) => {
                 self.bump();
                 if matches!(self.peek(), Token::LParen) {
@@ -591,8 +672,24 @@ impl<'a> Parser<'a> {
                     init: None,
                 })
             }
+            Token::Ident(ref id) if self.type_aliases.contains_key(id) => {
+                let ty = self.type_aliases.get(id).expect("checked").clone();
+                self.bump();
+                let vname = self.expect_ident()?;
+                if matches!(ty, Ty::Struct(_)) {
+                    Ok(Stmt::VarDecl {
+                        name: vname,
+                        ty,
+                        init: None,
+                    })
+                } else {
+                    self.decl_tail_for_var(ty, vname)
+                }
+            }
             other => Err(self
-                .error(format!("expected `int`, `bool`, `char`, or `struct` in for-init, found `{other:?}`"))
+                .error(format!(
+                    "expected `int`, `bool`, `char`, `struct`, or typedef name in for-init, found `{other:?}`"
+                ))
                 .into()),
         }
     }
@@ -606,7 +703,8 @@ impl<'a> Parser<'a> {
         if matches!(
             self.peek(),
             Token::KwInt | Token::KwBool | Token::KwChar | Token::KwStruct
-        ) {
+        ) || self.peek_is_typedef_name()
+        {
             let stmt = self.parse_var_decl_stmt()?;
             self.consume(Token::Semicolon, "`;`")?;
             return Ok(Some(Box::new(stmt)));
@@ -1109,6 +1207,58 @@ mod tests {
     fn line_comment_skipped() {
         let p = parse_program("// init\nint x = 0;").unwrap();
         assert_eq!(p.items.len(), 1);
+    }
+
+    #[test]
+    fn typedef_scalar_and_use() {
+        let p = parse_program(
+            "typedef int footype;\n\
+             footype x = 7;\n\
+             print_int(x);",
+        )
+        .unwrap();
+        assert_eq!(p.items.len(), 2);
+        match &p.items[0] {
+            Item::Stmt(Stmt::VarDecl { ty: Ty::Int, .. }) => {}
+            other => panic!("expected int var, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn typedef_struct_alias() {
+        let p = parse_program(
+            "struct S { int a; };\n\
+             typedef struct S S_alias;\n\
+             S_alias s;\n\
+             s.a = 3;",
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                &p.items[1],
+                Item::Stmt(Stmt::VarDecl {
+                    ty: Ty::Struct(tag),
+                    init: None,
+                    ..
+                }) if tag == "S"
+            ),
+            "{:?}",
+            p.items
+        );
+    }
+
+    #[test]
+    fn typedef_chain() {
+        let p = parse_program(
+            "typedef int A;\n\
+             typedef A B;\n\
+             B y = 1;",
+        )
+        .unwrap();
+        match &p.items[0] {
+            Item::Stmt(Stmt::VarDecl { ty: Ty::Int, .. }) => {}
+            other => panic!("expected int, got {other:?}"),
+        }
     }
 
     #[test]

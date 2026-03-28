@@ -4,6 +4,13 @@ struct Point {
     int arr[1000];
 };
 
+struct aa {
+    int a;
+    int b;
+};
+
+typedef struct Point PointType;
+
 int fib(int n) {
     if (n == 1) {
         return 1;
