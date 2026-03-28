@@ -8,7 +8,7 @@
 //!
 //! **C strings on the stack:** `char s[] = "text";` — **`print_string("...")`** or **`print_string(s)`** prints characters then a newline.
 //!
-//! **Structs:** `struct Point { int x; int y; };` then `struct Point p;` (**zero-initialized**), member access **`p.x`**, assignment and scratch **`struct` arguments** (flattened to words). **Struct return types** are rejected for now.
+//! **Structs:** `struct Point { int x; int y; };` then `struct Point p;` (**zero-initialized**), member access **`p.x`**, fields may be fixed arrays (`int xs[4];`), index with **`p.xs[i]`**. Assignment and scratch **`struct` arguments** (flattened to words). **Struct return types** are rejected for now.
 
 /// Value types in the surface language.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -18,6 +18,8 @@ pub enum Ty {
     Char,
     /// Named struct (`struct Tag` elsewhere).
     Struct(String),
+    /// Fixed-size array: **`elem[len]`** in struct fields (see [`Stmt::ArrayDecl`](Stmt::ArrayDecl) for locals). Nested array types and arrays of struct are rejected in lowering.
+    Array(Box<Ty>, usize),
 }
 
 /// Function return type (**`void`** or a scalar). **Struct return is not implemented.**
@@ -121,8 +123,9 @@ pub enum Expr {
         name: String,
         args: Vec<Expr>,
     },
+    /// `base[index]` — **`base`** is an array variable or a struct member that is an array (`p.arr`).
     Index {
-        base: String,
+        base: Box<Expr>,
         index: Box<Expr>,
     },
     /// `a.b` / nested `a.b.c` — **`base`** is [`Expr::Var`], [`Expr::Index`], or another [`Expr::Member`].

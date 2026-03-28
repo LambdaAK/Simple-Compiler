@@ -230,8 +230,9 @@ impl<'a> Parser<'a> {
             return Err(self.error("struct must have at least one member").into());
         }
         loop {
-            let ty = self.parse_type()?;
+            let base_ty = self.parse_type()?;
             let fname = self.expect_ident()?;
+            let ty = self.maybe_array_suffix_after_declarator(base_ty)?;
             self.consume(Token::Semicolon, "`;`")?;
             fields.push((fname, ty));
             match self.peek().clone() {
@@ -268,6 +269,36 @@ impl<'a> Parser<'a> {
                     "expected type (`int`, `bool`, `char`, or `struct Tag`), found `{other:?}`"
                 ))
                 .into()),
+        }
+    }
+
+    /// After the field name: optional **`[n]`** for a fixed array member (same as `int x[3];`).
+    fn maybe_array_suffix_after_declarator(&mut self, base: Ty) -> Result<Ty, FrontEndError> {
+        if matches!(self.peek(), Token::LBracket) {
+            self.bump();
+            let len = match self.bump() {
+                Token::IntLit(n) => n,
+                other => {
+                    return Err(self
+                        .error(format!(
+                            "array length must be a positive integer literal, found `{other:?}`"
+                        ))
+                        .into());
+                }
+            };
+            if len <= 0 {
+                return Err(self.error("array length must be positive").into());
+            }
+            let len = len as usize;
+            self.consume(Token::RBracket, "`]`")?;
+            if matches!(self.peek(), Token::LBracket) {
+                return Err(self
+                    .error("nested array fields (`[][]`) are not supported")
+                    .into());
+            }
+            Ok(Ty::Array(Box::new(base), len))
+        } else {
+            Ok(base)
         }
     }
 
@@ -628,11 +659,20 @@ impl<'a> Parser<'a> {
             let index = self.parse_expr()?;
             self.consume(Token::RBracket, "`]`")?;
             lhs = Expr::Index {
-                base: name,
+                base: Box::new(Expr::Var(name)),
                 index: Box::new(index),
             };
         }
         lhs = self.parse_member_chain(lhs)?;
+        while matches!(self.peek(), Token::LBracket) {
+            self.bump();
+            let index = self.parse_expr()?;
+            self.consume(Token::RBracket, "`]`")?;
+            lhs = Expr::Index {
+                base: Box::new(lhs),
+                index: Box::new(index),
+            };
+        }
         let stmt = match self.peek().clone() {
             Token::Assign => {
                 self.bump();
@@ -801,15 +841,15 @@ impl<'a> Parser<'a> {
                 let ix = self.parse_expr()?;
                 self.consume(Token::RBracket, "`]`")?;
                 match e {
-                    Expr::Var(name) => {
+                    Expr::Var(_) | Expr::Member { .. } => {
                         e = Expr::Index {
-                            base: name,
+                            base: Box::new(e),
                             index: Box::new(ix),
                         };
                     }
                     _ => {
                         return Err(self
-                            .error("`[` only applies to an array variable")
+                            .error("`[` only applies to an array variable or struct array member")
                             .into());
                     }
                 }
@@ -1069,6 +1109,27 @@ mod tests {
     fn line_comment_skipped() {
         let p = parse_program("// init\nint x = 0;").unwrap();
         assert_eq!(p.items.len(), 1);
+    }
+
+    #[test]
+    fn struct_def_with_array_field() {
+        let p = parse_program(
+            "struct S { int xs[2]; bool ok; };\n\
+             struct S s;\n\
+             s.xs[0] = 9;\n\
+             s.ok = true;",
+        )
+        .unwrap();
+        let Item::StructDef { fields, .. } = &p.items[0] else {
+            panic!("expected struct def");
+        };
+        assert!(matches!(
+            fields.as_slice(),
+            [
+                (_, Ty::Array(e, 2)),
+                (_, Ty::Bool),
+            ] if **e == Ty::Int
+        ));
     }
 
     #[test]

@@ -138,6 +138,11 @@ impl<'a> LowerCtx<'a> {
                     reg_cursor += 1;
                     slot_cursor += 1;
                 }
+                Ty::Array(..) => {
+                    return Err(LowerError::TypeMismatch(format!(
+                        "function `{name}`: array parameters are not supported"
+                    )));
+                }
                 Ty::Struct(tag) => {
                     let slot = format!("v{}", slot_cursor);
                     cx.scopes
@@ -371,6 +376,32 @@ impl<'a> LowerCtx<'a> {
         }
     }
 
+    /// Address of an array lvalue: local **`[]`** binding or **`struct`** member of array type.
+    fn resolve_array_expr(&self, base: &Expr) -> Result<(String, Ty, usize), LowerError> {
+        match base {
+            Expr::Var(name) => self.resolve_array(name),
+            Expr::Member { .. } => {
+                let (idx, fty) = self.member_object_and_ty(base)?;
+                match fty {
+                    Ty::Array(elem, len) => {
+                        if matches!(*elem, Ty::Struct(_)) {
+                            return Err(LowerError::TypeMismatch(
+                                "arrays of `struct` are not supported".into(),
+                            ));
+                        }
+                        Ok((format!("v{}", idx), *elem, len))
+                    }
+                    _ => Err(LowerError::TypeMismatch(
+                        "`[` requires an array (variable or struct member array)".into(),
+                    )),
+                }
+            }
+            _ => Err(LowerError::TypeMismatch(
+                "`[` base must be an array variable or struct member array".into(),
+            )),
+        }
+    }
+
     fn is_struct_ty(&self, ty: &Ty) -> bool {
         matches!(ty, Ty::Struct(_))
     }
@@ -436,7 +467,15 @@ impl<'a> LowerCtx<'a> {
                     ));
                 }
             }),
-            Expr::Member { .. } => self.member_object_and_ty(e),
+            Expr::Member { .. } => {
+                let (idx, fty) = self.member_object_and_ty(e)?;
+                if matches!(fty, Ty::Array(..)) {
+                    return Err(LowerError::TypeMismatch(
+                        "assign array elements with `[i]`, not the array member alone".into(),
+                    ));
+                }
+                Ok((idx, fty))
+            }
             Expr::Index { .. } => Err(LowerError::TypeMismatch(
                 "internal: index assign uses StoreIndex".into(),
             )),
@@ -479,6 +518,11 @@ impl<'a> LowerCtx<'a> {
             Ty::Struct(_) => {
                 return Err(LowerError::TypeMismatch(
                     "arrays of `struct` are not supported".into(),
+                ));
+            }
+            Ty::Array(_, _) => {
+                return Err(LowerError::TypeMismatch(
+                    "nested array types are not supported".into(),
                 ));
             }
             Ty::Bool => {
@@ -537,10 +581,20 @@ impl<'a> LowerCtx<'a> {
                     ));
                 };
                 let (fty, _) = self.struct_field_lookup(&tag, field)?;
+                if matches!(fty, Ty::Array(..)) {
+                    return Err(LowerError::TypeMismatch(
+                        "struct array member is not a scalar; subscript it with `[`".into(),
+                    ));
+                }
                 Ok(fty)
             }
             Expr::Index { base, index } => {
-                let (_, elem, _) = self.resolve_array(base)?;
+                let (_, elem, _) = self.resolve_array_expr(base)?;
+                if matches!(elem, Ty::Struct(_)) {
+                    return Err(LowerError::TypeMismatch(
+                        "arrays of `struct` are not supported".into(),
+                    ));
+                }
                 let it = self.expr_ty(index)?;
                 let ok = |t: Ty| t == Ty::Int || t == Ty::Char;
                 if !ok(it.clone()) {
@@ -558,6 +612,9 @@ impl<'a> LowerCtx<'a> {
                     )),
                     Ty::Struct(_) => Err(LowerError::TypeMismatch(
                         "postfix `++` cannot apply to struct".into(),
+                    )),
+                    Ty::Array(_, _) => Err(LowerError::TypeMismatch(
+                        "postfix `++` cannot apply to an array".into(),
                     )),
                     Ty::Int | Ty::Char => Ok(Ty::Int),
                 }
@@ -620,7 +677,11 @@ impl<'a> LowerCtx<'a> {
                 let rt = self.expr_ty(r)?;
                 match op {
                     BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => {
-                        if matches!(lt, Ty::Struct(_)) || matches!(rt, Ty::Struct(_)) {
+                        if matches!(lt, Ty::Struct(_))
+                            || matches!(rt, Ty::Struct(_))
+                            || matches!(lt, Ty::Array(..))
+                            || matches!(rt, Ty::Array(..))
+                        {
                             return Err(LowerError::TypeMismatch(format!(
                                 "`{op:?}` expects int or char operands, got {lt:?} and {rt:?}"
                             )));
@@ -634,9 +695,13 @@ impl<'a> LowerCtx<'a> {
                         Ok(Ty::Int)
                     }
                     BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
-                        if matches!(lt, Ty::Struct(_)) || matches!(rt, Ty::Struct(_)) {
+                        if matches!(lt, Ty::Struct(_))
+                            || matches!(rt, Ty::Struct(_))
+                            || matches!(lt, Ty::Array(..))
+                            || matches!(rt, Ty::Array(..))
+                        {
                             return Err(LowerError::TypeMismatch(
-                                "cannot compare structs".into(),
+                                "cannot compare structs or arrays".into(),
                             ));
                         }
                         let bool_cmp = lt == Ty::Bool && rt == Ty::Bool;
@@ -699,9 +764,9 @@ impl<'a> LowerCtx<'a> {
             }
             Expr::Member { .. } => {
                 let (idx, fty) = self.member_object_and_ty(expr)?;
-                if self.is_struct_ty(&fty) {
+                if self.is_struct_ty(&fty) || matches!(fty, Ty::Array(..)) {
                     return Err(LowerError::TypeMismatch(
-                        "use struct only in assignment, call argument, or member chain".into(),
+                        "use struct only in assignment, call argument, or member chain; index array members with `[`".into(),
                     ));
                 }
                 let dst = self.fresh_temp();
@@ -711,7 +776,7 @@ impl<'a> LowerCtx<'a> {
                 Ok(dst)
             }
             Expr::Index { base, index } => {
-                let (first, _, len) = self.resolve_array(base)?;
+                let (first, _, len) = self.resolve_array_expr(base)?;
                 let idx_t = self.lower_expr(index)?;
                 let dst = self.fresh_temp();
                 self
@@ -764,7 +829,7 @@ impl<'a> LowerCtx<'a> {
     fn lower_post_inc_expr(&mut self, inner: &Expr) -> Result<String, LowerError> {
         match inner {
             Expr::Index { base, index } => {
-                let (first, var_ty, len) = self.resolve_array(base)?;
+                let (first, var_ty, len) = self.resolve_array_expr(base)?;
                 if matches!(var_ty, Ty::Struct(_)) {
                     return Err(LowerError::TypeMismatch(
                         "arrays of struct not supported".into(),
@@ -801,7 +866,7 @@ impl<'a> LowerCtx<'a> {
                             .push(Instr::StoreIndex(first, idx_t, stored, len));
                         Ok(old)
                     }
-                    Ty::Struct(_) => unreachable!(),
+                    Ty::Struct(_) | Ty::Array(_, _) => unreachable!(),
                 }
             }
             assign_target => {
@@ -813,6 +878,9 @@ impl<'a> LowerCtx<'a> {
             )),
             Ty::Struct(_) => Err(LowerError::TypeMismatch(
                 "postfix `++` on struct member must be scalar".into(),
+            )),
+            Ty::Array(_, _) => Err(LowerError::TypeMismatch(
+                "postfix `++` on array member must use `[i]`".into(),
             )),
             Ty::Int => {
                 let old = self.fresh_temp();
@@ -846,7 +914,7 @@ impl<'a> LowerCtx<'a> {
     fn lower_add_assign(&mut self, target: &Expr, rhs: &Expr) -> Result<(), LowerError> {
         match target {
             Expr::Index { base, index } => {
-                let (first, var_ty, len) = self.resolve_array(base)?;
+                let (first, var_ty, len) = self.resolve_array_expr(base)?;
                 if matches!(var_ty, Ty::Struct(_)) {
                     return Err(LowerError::TypeMismatch(
                         "arrays of struct not supported".into(),
@@ -893,6 +961,9 @@ impl<'a> LowerCtx<'a> {
             )),
             Ty::Struct(_) => Err(LowerError::TypeMismatch(
                 "`+=` cannot apply to a struct".into(),
+            )),
+            Ty::Array(_, _) => Err(LowerError::TypeMismatch(
+                "`+=` on an array member must use `[i]`".into(),
             )),
             Ty::Int => {
                 let rt = self.expr_ty(rhs)?;
@@ -1229,7 +1300,7 @@ impl<'a> LowerCtx<'a> {
             Stmt::Assign { target, value } => {
                 match target {
                     Expr::Index { base, index } => {
-                        let (first, elem_ty, len) = self.resolve_array(base)?;
+                        let (first, elem_ty, len) = self.resolve_array_expr(base)?;
                         match elem_ty {
                             Ty::Char => match value {
                                 Expr::IntLit(n) => {
@@ -1483,6 +1554,20 @@ fn ty_size_words(ty: &Ty, layouts: &HashMap<String, StructLayout>) -> Result<usi
             .get(name)
             .map(|l| l.size_words)
             .ok_or_else(|| LowerError::UnknownStruct(name.clone())),
+        Ty::Array(elem, n) => {
+            if matches!(**elem, Ty::Struct(_)) {
+                return Err(LowerError::TypeMismatch(
+                    "arrays of `struct` are not supported".into(),
+                ));
+            }
+            if matches!(**elem, Ty::Array(_, _)) {
+                return Err(LowerError::TypeMismatch(
+                    "nested array types are not supported".into(),
+                ));
+            }
+            let ew = ty_size_words(elem, layouts)?;
+            Ok(ew * n)
+        }
     }
 }
 
@@ -1526,13 +1611,10 @@ fn layout_struct(
     let mut offset = 0usize;
     let mut fields = Vec::new();
     for (fname, fty) in fields_def {
-        let sz = match fty {
-            Ty::Int | Ty::Bool | Ty::Char => 1usize,
-            Ty::Struct(inner) => {
-                layout_struct(inner, defs, visiting, done)?;
-                done.get(inner).unwrap().size_words
-            }
-        };
+        if let Ty::Struct(inner) = fty {
+            layout_struct(inner, defs, visiting, done)?;
+        }
+        let sz = ty_size_words(fty, done)?;
         fields.push((fname.clone(), fty.clone(), offset));
         offset += sz;
     }
@@ -1863,6 +1945,26 @@ mod tests {
         );
         assert!(
             ir.main.instrs.iter().any(|i| matches!(i, Instr::PrintNl)),
+            "{ir:?}"
+        );
+    }
+
+    #[test]
+    fn struct_member_array_index_store_load() {
+        let p = parse_program(
+            "struct S { int xs[3]; };\n\
+             struct S s;\n\
+             s.xs[1] = 42;\n\
+             print_int(s.xs[1]);",
+        )
+        .unwrap();
+        let ir = lower_program(&p).unwrap();
+        assert!(
+            ir.main.instrs.iter().any(|i| matches!(i, Instr::StoreIndex(_, _, _, 3))),
+            "{ir:?}"
+        );
+        assert!(
+            ir.main.instrs.iter().any(|i| matches!(i, Instr::LoadIndex(_, _, _, 3))),
             "{ir:?}"
         );
     }

@@ -1,7 +1,7 @@
 struct Point {
     int x;
     int y;
-    int arr;
+    int arr[10];
 };
 
 int fib(int n) {
@@ -25,11 +25,15 @@ int fact(int n) {
 }
 
 int norm(struct Point p) {
+    for (int i = 0; i < 5; i++) {
+        print_int(p.arr[i]);
+    }
     return p.x * p.x + p.y * p.y;
 }
 
 struct Point a;
 a.x = 5;
 a.y = 5;
+a.arr[0] = 10101;
 
 print_int(norm(a));
