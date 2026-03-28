@@ -91,6 +91,13 @@ pub enum Instr {
     /// `first_slot[index] = src`
     StoreIndex(String, Temp, Temp, usize),
 
+    /// `dst = sp + offset(key)` where **`key`** names a stack slot (`v0`…); **`byte_off`** added to that slot’s offset (field / inner LEA).
+    AddrLocal(Temp, String, usize),
+    /// `dst = *ptr` (**64-bit** word loaded from address **`ptr`**).
+    LoadMem(Temp, Temp),
+    /// `*ptr = src` (**64-bit** word stored).
+    StoreMem(Temp, Temp),
+
     // --- calls (`callee` is source name; codegen adds `_`) ---
     /// User function call; **`dst`** absent for **void** callees.
     Call {

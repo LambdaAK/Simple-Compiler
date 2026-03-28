@@ -60,6 +60,10 @@ pub enum Token {
     Assign,
     /// `.` (struct member)
     Dot,
+    /// `&` (address-of); `&&` stays [`Token::AndAnd`].
+    Ampersand,
+    /// `->` (member through pointer)
+    Arrow,
 
     // --- punctuation ---
     Semicolon,

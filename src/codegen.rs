@@ -191,6 +191,18 @@ fn collect_slots(instrs: &[Instr]) -> Vec<String> {
                 note(idx);
                 note(src);
             }
+            Instr::AddrLocal(d, base, _) => {
+                note(d);
+                note(base);
+            }
+            Instr::LoadMem(d, p) => {
+                note(d);
+                note(p);
+            }
+            Instr::StoreMem(p, s) => {
+                note(p);
+                note(s);
+            }
             Instr::JumpIfZero(c, _) => note(c),
             Instr::Call { dst, args, .. } => {
                 if let Some(d) = dst {
@@ -375,6 +387,21 @@ fn emit_instr(
             ldr_stack(o, "x8", oa(src));
             add_sp_offset(o, "x9", oa(first_slot));
             writeln!(o, "    str x8, [x9, x10, lsl #3]").unwrap();
+        }
+        Instr::AddrLocal(dst, base_slot, byte_off) => {
+            let total = oa(base_slot) + byte_off;
+            add_sp_offset(o, "x8", total);
+            str_stack(o, "x8", oa(dst));
+        }
+        Instr::LoadMem(dst, ptr) => {
+            ldr_stack(o, "x9", oa(ptr));
+            writeln!(o, "    ldr x8, [x9]").unwrap();
+            str_stack(o, "x8", oa(dst));
+        }
+        Instr::StoreMem(ptr, src) => {
+            ldr_stack(o, "x9", oa(ptr));
+            ldr_stack(o, "x8", oa(src));
+            writeln!(o, "    str x8, [x9]").unwrap();
         }
         Instr::Label(name) => {
             writeln!(o, "{}:", asm_label(name)).unwrap();

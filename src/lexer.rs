@@ -53,8 +53,13 @@ pub fn lex(source: &str) -> Result<Vec<Token>, LexError> {
                 }
             }
             b'-' => {
-                out.push(Token::Minus);
-                i += 1;
+                if bytes.get(i + 1) == Some(&b'>') {
+                    out.push(Token::Arrow);
+                    i += 2;
+                } else {
+                    out.push(Token::Minus);
+                    i += 1;
+                }
             }
             b'*' => {
                 out.push(Token::Star);
@@ -141,7 +146,8 @@ pub fn lex(source: &str) -> Result<Vec<Token>, LexError> {
                     out.push(Token::AndAnd);
                     i += 2;
                 } else {
-                    return Err(LexError::new(i, "expected `&&`"));
+                    out.push(Token::Ampersand);
+                    i += 1;
                 }
             }
             b'|' => {

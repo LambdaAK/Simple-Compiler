@@ -1,51 +1,8 @@
-struct Point {
-    int x;
-    int y;
-    int arr[1000];
-};
 
-struct aa {
-    int a;
-    int b;
-};
+int i = 1;
 
-typedef struct Point PointType;
+int* ptr = &i;
 
-int fib(int n) {
-    if (n == 1) {
-        return 1;
-    }
+*ptr += 1;
 
-    if (n == 2) {
-        return 1;
-    }
-
-    return fib(n - 1) + fib(n - 2);
-}
-
-int fact(int n) {
-    if (n == 0) {
-        return 1;
-    }
-
-    return n * fact(n - 1);
-}
-
-int norm(struct Point p) {
-
-    for (int i = 0; i < 1000; i++) {
-        print_int(p.arr[i]);
-    }
-
-    return p.x * p.x + p.y * p.y;
-}
-
-struct Point a;
-a.x = 5;
-a.y = 5;
-
-for (int i = 0; i < 1000; i++) {
-    a.arr[i] = i;
-}
-
-print_int(norm(a));
+print_int(i);

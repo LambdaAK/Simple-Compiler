@@ -22,6 +22,8 @@ pub enum Ty {
     Struct(String),
     /// Fixed-size array: **`elem[len]`** in struct fields (see [`Stmt::ArrayDecl`](Stmt::ArrayDecl) for locals). Nested array types and arrays of struct are rejected in lowering.
     Array(Box<Ty>, usize),
+    /// Pointer (**`T *`**); address is one machine word. **`void*`** is not supported.
+    Ptr(Box<Ty>),
 }
 
 /// Function return type (**`void`** or a scalar). **Struct return is not implemented.**
@@ -144,6 +146,10 @@ pub enum Expr {
 pub enum UnaryOp {
     Neg,
     Not,
+    /// Address-of **`&x`** (operand must be an lvalue).
+    Addr,
+    /// Indirection **`*p`** (operand must be a pointer).
+    Deref,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

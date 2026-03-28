@@ -117,6 +117,30 @@ impl<'a> LowerCtx<'a> {
         for (pname, ty) in params {
             let words = ty_size_words(ty, struct_layouts)?;
             match ty {
+                Ty::Ptr(_) => {
+                    let slot = format!("v{}", slot_cursor);
+                    cx.scopes
+                        .last_mut()
+                        .expect("lower: root scope")
+                        .insert(
+                            pname.clone(),
+                            Binding::Scalar {
+                                slot: slot.clone(),
+                                ty: ty.clone(),
+                            },
+                        );
+                    if arg_word < REG_ARG_WORDS {
+                        cx.ir
+                            .push(Instr::RecvParam(slot, arg_word.try_into().unwrap()));
+                    } else {
+                        cx.ir.push(Instr::RecvParamStack(
+                            slot,
+                            (arg_word - REG_ARG_WORDS).try_into().unwrap(),
+                        ));
+                    }
+                    arg_word += 1;
+                    slot_cursor += 1;
+                }
                 Ty::Int | Ty::Bool | Ty::Char => {
                     let slot = format!("v{}", slot_cursor);
                     cx.scopes
@@ -416,6 +440,211 @@ impl<'a> LowerCtx<'a> {
         matches!(ty, Ty::Struct(_))
     }
 
+    /// True if this member chain runs through a **`struct *`** (variable or `*p` / `->` prefix).
+    fn member_access_is_via_pointer(&self, base: &Expr) -> bool {
+        match base {
+            Expr::Unary(UnaryOp::Deref, _) => true,
+            Expr::Var(name) => match self.resolve(name) {
+                Ok(Binding::Scalar { ty, .. }) => {
+                    matches!(ty, Ty::Ptr(b) if self.is_struct_ty(&*b))
+                }
+                _ => false,
+            },
+            Expr::Member { base: b, .. } => self.member_access_is_via_pointer(b),
+            _ => false,
+        }
+    }
+
+    /// Struct tag for the object on the left of **`.`** / **`->`**: struct value, **`struct *`**, or **`(*p)`**.
+    fn member_receiver_struct_tag(&self, base: &Expr) -> Result<String, LowerError> {
+        match base {
+            Expr::Var(name) => match self.resolve(name)? {
+                Binding::Scalar { ty, .. } => match ty {
+                    Ty::Struct(t) => Ok(t),
+                    Ty::Ptr(b) => match *b {
+                        Ty::Struct(t) => Ok(t),
+                        _ => Err(LowerError::TypeMismatch(
+                            "member access requires `struct` or `struct *`".into(),
+                        )),
+                    },
+                    _ => Err(LowerError::TypeMismatch(
+                        "`.` requires a struct or struct pointer on the left".into(),
+                    )),
+                },
+                Binding::Struct { tag, .. } => Ok(tag),
+                Binding::Array { .. } => Err(LowerError::TypeMismatch(
+                    "`.` on an array is not allowed (only `[]`)".into(),
+                )),
+            },
+            Expr::Unary(UnaryOp::Deref, inner) => match self.expr_ty(inner)? {
+                Ty::Ptr(b) => match &*b {
+                    Ty::Struct(t) => Ok(t.clone()),
+                    _ => Err(LowerError::TypeMismatch(
+                        "`*` for member access must be `struct *`".into(),
+                    )),
+                },
+                _ => Err(LowerError::TypeMismatch(
+                    "`*` operand must be a pointer".into(),
+                )),
+            },
+            Expr::Member { base: b, field: f } => {
+                let tag = self.member_receiver_struct_tag(b)?;
+                let (fty, _) = self.struct_field_lookup(&tag, f)?;
+                match &fty {
+                    Ty::Struct(inner) => Ok(inner.clone()),
+                    Ty::Ptr(ib) => match &**ib {
+                        Ty::Struct(inner) => Ok(inner.clone()),
+                        _ => Err(LowerError::TypeMismatch(
+                            "nested `->` / `.` requires a struct or `struct *` field here".into(),
+                        )),
+                    },
+                    _ => Err(LowerError::TypeMismatch(
+                        "nested member access requires a struct or pointer-to-struct field on the left".into(),
+                    )),
+                }
+            }
+            _ => Err(LowerError::TypeMismatch(
+                "invalid expression before `.` or `->`".into(),
+            )),
+        }
+    }
+
+    fn lvalue_pointee_ty(&self, e: &Expr) -> Result<Ty, LowerError> {
+        match e {
+            Expr::Var(name) => match self.resolve(name)? {
+                Binding::Scalar { ty, .. } => Ok(ty.clone()),
+                Binding::Struct { tag, .. } => Ok(Ty::Struct(tag.clone())),
+                Binding::Array { elem, .. } => Ok(elem.clone()),
+            },
+            Expr::Member { base, field } => {
+                let tag = self.member_receiver_struct_tag(base)?;
+                let (fty, _) = self.struct_field_lookup(&tag, field)?;
+                if matches!(fty, Ty::Array(..)) {
+                    return Err(LowerError::TypeMismatch(
+                        "cannot take address of struct array member (use `&s.f[0]`)".into(),
+                    ));
+                }
+                Ok(fty)
+            }
+            Expr::Index { base, index } => {
+                let (_, elem, _) = self.resolve_array_expr(base)?;
+                if matches!(elem, Ty::Struct(_)) {
+                    return Err(LowerError::TypeMismatch(
+                        "arrays of `struct` are not supported".into(),
+                    ));
+                }
+                let it = self.expr_ty(index)?;
+                if it != Ty::Int && it != Ty::Char {
+                    return Err(LowerError::TypeMismatch(
+                        "array index must be int or char".into(),
+                    ));
+                }
+                Ok(elem)
+            }
+            Expr::Unary(UnaryOp::Deref, inner) => match self.expr_ty(inner)? {
+                Ty::Ptr(b) => Ok(*b),
+                _ => Err(LowerError::TypeMismatch(
+                    "`&*` requires a pointer operand".into(),
+                )),
+            },
+            _ => Err(LowerError::TypeMismatch(
+                "argument of `&` must be an lvalue".into(),
+            )),
+        }
+    }
+
+    /// Address of **`member`** through a **`struct *`** chain (`p->a`, `(*q).b`).
+    fn lower_ptr_member_address(&mut self, e: &Expr) -> Result<(String, Ty), LowerError> {
+        let Expr::Member { base, field } = e else {
+            unreachable!("lower_ptr_member_address on non-Member");
+        };
+        let tag = self.member_receiver_struct_tag(base)?;
+        let (fty, off_words) = self.struct_field_lookup(&tag, field)?;
+        let ptr_t = match base.as_ref() {
+            Expr::Var(name) => match self.resolve(name)? {
+                Binding::Scalar { ty, .. } if matches!(ty, Ty::Ptr(_)) => {
+                    self.lower_expr(&Expr::Var(name.clone()))?
+                }
+                _ => {
+                    return Err(LowerError::TypeMismatch(
+                        "internal: expected struct pointer base".into(),
+                    ));
+                }
+            },
+            Expr::Unary(UnaryOp::Deref, inner) => self.lower_expr(inner.as_ref())?,
+            _ => {
+                return Err(LowerError::TypeMismatch(
+                    "internal: bad pointer member base".into(),
+                ));
+            }
+        };
+        let off_bytes = off_words * 8;
+        if off_bytes == 0 {
+            return Ok((ptr_t, fty));
+        }
+        let c = self.fresh_temp();
+        self.ir.push(Instr::Const(c.clone(), off_bytes as i64));
+        let addr = self.fresh_temp();
+        self.ir.push(Instr::Add(addr.clone(), ptr_t, c));
+        Ok((addr, fty))
+    }
+
+    fn lower_address_of(&mut self, e: &Expr) -> Result<String, LowerError> {
+        let dst = self.fresh_temp();
+        match e {
+            Expr::Unary(UnaryOp::Deref, inner) => {
+                return Ok(self.lower_expr(inner.as_ref())?);
+            }
+            Expr::Var(name) => match self.resolve(name)? {
+                Binding::Scalar { slot, .. } => {
+                    self.ir.push(Instr::AddrLocal(dst.clone(), slot, 0));
+                }
+                Binding::Struct { first_slot, .. } => {
+                    self
+                        .ir
+                        .push(Instr::AddrLocal(dst.clone(), first_slot, 0));
+                }
+                Binding::Array { first_slot, .. } => {
+                    self
+                        .ir
+                        .push(Instr::AddrLocal(dst.clone(), first_slot, 0));
+                }
+            },
+            Expr::Member { .. } => {
+                if let Ok((idx, _)) = self.member_object_and_ty(e) {
+                    self
+                        .ir
+                        .push(Instr::AddrLocal(
+                            dst.clone(),
+                            format!("v{}", idx),
+                            0,
+                        ));
+                } else {
+                    let (addr, _) = self.lower_ptr_member_address(e)?;
+                    return Ok(addr);
+                }
+            }
+            Expr::Index { base, index } => {
+                let (first, _, _) = self.resolve_array_expr(base)?;
+                let a0 = self.fresh_temp();
+                self.ir.push(Instr::AddrLocal(a0.clone(), first, 0));
+                let idx_t = self.lower_expr(index)?;
+                let eight = self.fresh_temp();
+                self.ir.push(Instr::Const(eight.clone(), 8));
+                let off = self.fresh_temp();
+                self.ir.push(Instr::Mul(off.clone(), idx_t, eight));
+                self.ir.push(Instr::Add(dst.clone(), a0, off));
+                return Ok(dst);
+            }
+            _ => {
+                return Err(LowerError::TypeMismatch(
+                    "invalid operand for `&`".into(),
+                ));
+            }
+        }
+        Ok(dst)
+    }
+
     fn struct_field_lookup(
         &self,
         tag: &str,
@@ -546,6 +775,11 @@ impl<'a> LowerCtx<'a> {
                     )));
                 }
             }
+            Ty::Ptr(_) => {
+                return Err(LowerError::TypeMismatch(
+                    "array elements cannot be pointers in this compiler".into(),
+                ));
+            }
             Ty::Char => match e {
                 Expr::IntLit(n) => {
                     if *n < 0 || *n > 255 {
@@ -584,16 +818,16 @@ impl<'a> LowerCtx<'a> {
                 ))),
             },
             Expr::Member { base, field } => {
-                let bty = self.expr_ty(base)?;
-                let Ty::Struct(tag) = bty else {
-                    return Err(LowerError::TypeMismatch(
-                        "`.` requires struct on the left".into(),
-                    ));
-                };
+                let tag = self.member_receiver_struct_tag(base)?;
                 let (fty, _) = self.struct_field_lookup(&tag, field)?;
                 if matches!(fty, Ty::Array(..)) {
                     return Err(LowerError::TypeMismatch(
                         "struct array member is not a scalar; subscript it with `[`".into(),
+                    ));
+                }
+                if self.member_access_is_via_pointer(base) && self.is_struct_ty(&fty) {
+                    return Err(LowerError::TypeMismatch(
+                        "struct field through `->` or `*p` cannot be used as a value; use a scalar field or a stack `struct`".into(),
                     ));
                 }
                 Ok(fty)
@@ -626,12 +860,37 @@ impl<'a> LowerCtx<'a> {
                     Ty::Array(_, _) => Err(LowerError::TypeMismatch(
                         "postfix `++` cannot apply to an array".into(),
                     )),
+                    Ty::Ptr(_) => Err(LowerError::TypeMismatch(
+                        "postfix `++` cannot apply to a pointer".into(),
+                    )),
                     Ty::Int | Ty::Char => Ok(Ty::Int),
                 }
             }
+            Expr::Unary(UnaryOp::Addr, e) => {
+                let inner = self.lvalue_pointee_ty(e)?;
+                Ok(Ty::Ptr(Box::new(inner)))
+            }
+            Expr::Unary(UnaryOp::Deref, e) => match self.expr_ty(e)? {
+                Ty::Ptr(b) => {
+                    if self.is_struct_ty(&*b) {
+                        return Err(LowerError::TypeMismatch(
+                            "`*` on `struct *` is not a value; use `->` or `(*p).field`".into(),
+                        ));
+                    }
+                    if matches!(*b, Ty::Array(..)) {
+                        return Err(LowerError::TypeMismatch(
+                            "cannot dereference pointer to array here".into(),
+                        ));
+                    }
+                    Ok(*b)
+                }
+                _ => Err(LowerError::TypeMismatch(
+                    "`*` operand must be a pointer".into(),
+                )),
+            },
             Expr::Unary(UnaryOp::Neg, e) => {
                 let t = self.expr_ty(e)?;
-                if matches!(t, Ty::Struct(_)) {
+                if matches!(t, Ty::Struct(_) | Ty::Ptr(_) | Ty::Array(..)) {
                     return Err(LowerError::TypeMismatch(
                         "unary `-` expects int or char operand".into(),
                     ));
@@ -646,7 +905,7 @@ impl<'a> LowerCtx<'a> {
             }
             Expr::Unary(UnaryOp::Not, e) => {
                 let t = self.expr_ty(e)?;
-                if matches!(t, Ty::Struct(_)) {
+                if matches!(t, Ty::Struct(_) | Ty::Ptr(_) | Ty::Array(..)) {
                     return Err(LowerError::TypeMismatch(
                         "unary `!` expects bool operand".into(),
                     ));
@@ -691,6 +950,8 @@ impl<'a> LowerCtx<'a> {
                             || matches!(rt, Ty::Struct(_))
                             || matches!(lt, Ty::Array(..))
                             || matches!(rt, Ty::Array(..))
+                            || matches!(lt, Ty::Ptr(_))
+                            || matches!(rt, Ty::Ptr(_))
                         {
                             return Err(LowerError::TypeMismatch(format!(
                                 "`{op:?}` expects int or char operands, got {lt:?} and {rt:?}"
@@ -713,6 +974,24 @@ impl<'a> LowerCtx<'a> {
                             return Err(LowerError::TypeMismatch(
                                 "cannot compare structs or arrays".into(),
                             ));
+                        }
+                        let ptr_null_cmp = matches!((&lt, &rt), (Ty::Ptr(_), Ty::Int)
+                            | (Ty::Int, Ty::Ptr(_))
+                            | (Ty::Ptr(_), Ty::Char)
+                            | (Ty::Char, Ty::Ptr(_)));
+                        let ptr_ptr_cmp = matches!((&lt, &rt), (Ty::Ptr(_), Ty::Ptr(_)));
+                        if ptr_null_cmp || (ptr_ptr_cmp && lt == rt && matches!(op, BinOp::Eq | BinOp::Ne)) {
+                            if !matches!(op, BinOp::Eq | BinOp::Ne) {
+                                return Err(LowerError::TypeMismatch(
+                                    "only `==` and `!=` are allowed for pointers".into(),
+                                ));
+                            }
+                            return Ok(Ty::Bool);
+                        }
+                        if ptr_ptr_cmp && lt != rt {
+                            return Err(LowerError::TypeMismatch(format!(
+                                "pointer type mismatch: {lt:?} vs {rt:?}"
+                            )));
                         }
                         let bool_cmp = lt == Ty::Bool && rt == Ty::Bool;
                         let num_cmp = (lt == Ty::Int || lt == Ty::Char)
@@ -773,17 +1052,28 @@ impl<'a> LowerCtx<'a> {
                 }
             }
             Expr::Member { .. } => {
-                let (idx, fty) = self.member_object_and_ty(expr)?;
-                if self.is_struct_ty(&fty) || matches!(fty, Ty::Array(..)) {
-                    return Err(LowerError::TypeMismatch(
-                        "use struct only in assignment, call argument, or member chain; index array members with `[`".into(),
-                    ));
+                if let Ok((idx, fty)) = self.member_object_and_ty(expr) {
+                    if self.is_struct_ty(&fty) || matches!(fty, Ty::Array(..)) {
+                        return Err(LowerError::TypeMismatch(
+                            "use struct only in assignment, call argument, or member chain; index array members with `[`".into(),
+                        ));
+                    }
+                    let dst = self.fresh_temp();
+                    self
+                        .ir
+                        .push(Instr::LoadVar(dst.clone(), format!("v{}", idx)));
+                    Ok(dst)
+                } else {
+                    let (addr, fty) = self.lower_ptr_member_address(expr)?;
+                    if self.is_struct_ty(&fty) || matches!(fty, Ty::Array(..)) {
+                        return Err(LowerError::TypeMismatch(
+                            "loading a struct or array through `->`/`*p` is not supported here".into(),
+                        ));
+                    }
+                    let dst = self.fresh_temp();
+                    self.ir.push(Instr::LoadMem(dst.clone(), addr));
+                    Ok(dst)
                 }
-                let dst = self.fresh_temp();
-                self
-                    .ir
-                    .push(Instr::LoadVar(dst.clone(), format!("v{}", idx)));
-                Ok(dst)
             }
             Expr::Index { base, index } => {
                 let (first, _, len) = self.resolve_array_expr(base)?;
@@ -795,16 +1085,27 @@ impl<'a> LowerCtx<'a> {
                 Ok(dst)
             }
             Expr::PostInc(inner) => self.lower_post_inc_expr(inner),
-            Expr::Unary(op, inner) => {
-                let src = self.lower_expr(inner)?;
-                let dst = self.fresh_temp();
-                let instr = match op {
-                    UnaryOp::Neg => Instr::Neg(dst.clone(), src),
-                    UnaryOp::Not => Instr::Not(dst.clone(), src),
-                };
-                self.ir.push(instr);
-                Ok(dst)
-            }
+            Expr::Unary(op, inner) => match op {
+                UnaryOp::Addr => self.lower_address_of(inner),
+                UnaryOp::Deref => {
+                    let ptr_t = self.lower_expr(inner)?;
+                    let dst = self.fresh_temp();
+                    self.ir.push(Instr::LoadMem(dst.clone(), ptr_t));
+                    Ok(dst)
+                }
+                UnaryOp::Neg => {
+                    let src = self.lower_expr(inner)?;
+                    let dst = self.fresh_temp();
+                    self.ir.push(Instr::Neg(dst.clone(), src));
+                    Ok(dst)
+                }
+                UnaryOp::Not => {
+                    let src = self.lower_expr(inner)?;
+                    let dst = self.fresh_temp();
+                    self.ir.push(Instr::Not(dst.clone(), src));
+                    Ok(dst)
+                }
+            },
             Expr::Call { name, args } => {
                 let v = self.lower_call(name, args, true)?;
                 v.ok_or_else(|| {
@@ -838,6 +1139,71 @@ impl<'a> LowerCtx<'a> {
     /// Postfix `i++`: load old, add 1, store (mask **`char`** to 0–255), return old value (**`int`**).
     fn lower_post_inc_expr(&mut self, inner: &Expr) -> Result<String, LowerError> {
         match inner {
+            Expr::Unary(UnaryOp::Deref, ptr_e) => {
+                let pointee = match self.expr_ty(ptr_e)? {
+                    Ty::Ptr(b) => (*b).clone(),
+                    _ => {
+                        return Err(LowerError::TypeMismatch(
+                            "`++` through `*` expects a pointer operand".into(),
+                        ));
+                    }
+                };
+                match pointee {
+                    Ty::Bool | Ty::Struct(_) | Ty::Array(_, _) | Ty::Ptr(_) => Err(
+                        LowerError::TypeMismatch("postfix `++` through `*` expects int or char".into()),
+                    ),
+                    Ty::Int | Ty::Char => {
+                        let ptr_t = self.lower_expr(ptr_e)?;
+                        let old = self.fresh_temp();
+                        self.ir.push(Instr::LoadMem(old.clone(), ptr_t.clone()));
+                        let one = self.fresh_temp();
+                        self.ir.push(Instr::Const(one.clone(), 1));
+                        let new = self.fresh_temp();
+                        self.ir.push(Instr::Add(new.clone(), old.clone(), one));
+                        let stored = if pointee == Ty::Char {
+                            let c255 = self.fresh_temp();
+                            self.ir.push(Instr::Const(c255.clone(), 255));
+                            let masked = self.fresh_temp();
+                            self.ir.push(Instr::And(masked.clone(), new, c255));
+                            masked
+                        } else {
+                            new
+                        };
+                        self.ir.push(Instr::StoreMem(ptr_t, stored));
+                        Ok(old)
+                    }
+                }
+            }
+            Expr::Member { .. } if self.member_object_and_ty(inner).is_err() => {
+                let var_ty = self.expr_ty(inner)?;
+                match var_ty {
+                    Ty::Bool | Ty::Struct(_) | Ty::Array(_, _) | Ty::Ptr(_) => Err(
+                        LowerError::TypeMismatch(
+                            "postfix `++` through `->` expects int or char field".into(),
+                        ),
+                    ),
+                    Ty::Int | Ty::Char => {
+                        let (addr, _) = self.lower_ptr_member_address(inner)?;
+                        let old = self.fresh_temp();
+                        self.ir.push(Instr::LoadMem(old.clone(), addr.clone()));
+                        let one = self.fresh_temp();
+                        self.ir.push(Instr::Const(one.clone(), 1));
+                        let new = self.fresh_temp();
+                        self.ir.push(Instr::Add(new.clone(), old.clone(), one));
+                        let stored = if var_ty == Ty::Char {
+                            let c255 = self.fresh_temp();
+                            self.ir.push(Instr::Const(c255.clone(), 255));
+                            let masked = self.fresh_temp();
+                            self.ir.push(Instr::And(masked.clone(), new, c255));
+                            masked
+                        } else {
+                            new
+                        };
+                        self.ir.push(Instr::StoreMem(addr, stored));
+                        Ok(old)
+                    }
+                }
+            }
             Expr::Index { base, index } => {
                 let (first, var_ty, len) = self.resolve_array_expr(base)?;
                 if matches!(var_ty, Ty::Struct(_)) {
@@ -848,6 +1214,9 @@ impl<'a> LowerCtx<'a> {
                 match var_ty {
                     Ty::Bool => Err(LowerError::TypeMismatch(
                         "postfix `++` expects int or char variable".into(),
+                    )),
+                    Ty::Ptr(_) => Err(LowerError::TypeMismatch(
+                        "postfix `++` cannot apply to a pointer array element".into(),
                     )),
                     Ty::Int | Ty::Char => {
                         let idx_t = self.lower_expr(index)?;
@@ -892,6 +1261,9 @@ impl<'a> LowerCtx<'a> {
             Ty::Array(_, _) => Err(LowerError::TypeMismatch(
                 "postfix `++` on array member must use `[i]`".into(),
             )),
+            Ty::Ptr(_) => Err(LowerError::TypeMismatch(
+                "postfix `++` cannot apply to a pointer variable".into(),
+            )),
             Ty::Int => {
                 let old = self.fresh_temp();
                 self.ir.push(Instr::LoadVar(old.clone(), slot.clone()));
@@ -923,6 +1295,81 @@ impl<'a> LowerCtx<'a> {
 
     fn lower_add_assign(&mut self, target: &Expr, rhs: &Expr) -> Result<(), LowerError> {
         match target {
+            Expr::Unary(UnaryOp::Deref, ptr_e) => {
+                let pointee = match self.expr_ty(ptr_e)? {
+                    Ty::Ptr(b) => (*b).clone(),
+                    _ => {
+                        return Err(LowerError::TypeMismatch(
+                            "`+=` through `*` expects a pointer operand".into(),
+                        ));
+                    }
+                };
+                let rt = self.expr_ty(rhs)?;
+                let ok = |t: Ty| t == Ty::Int || t == Ty::Char;
+                if !ok(rt.clone()) {
+                    return Err(LowerError::TypeMismatch(format!(
+                        "`+=` through `*` expects int or char RHS, got {rt:?}"
+                    )));
+                }
+                match pointee {
+                    Ty::Bool | Ty::Struct(_) | Ty::Array(_, _) | Ty::Ptr(_) => Err(
+                        LowerError::TypeMismatch("`+=` through `*` expects int or char pointee".into()),
+                    ),
+                    Ty::Int | Ty::Char => {
+                        let ptr_t = self.lower_expr(ptr_e)?;
+                        let old = self.fresh_temp();
+                        self.ir.push(Instr::LoadMem(old.clone(), ptr_t.clone()));
+                        let r = self.lower_expr(rhs)?;
+                        let new = self.fresh_temp();
+                        self.ir.push(Instr::Add(new.clone(), old, r));
+                        let stored = if pointee == Ty::Char {
+                            let c255 = self.fresh_temp();
+                            self.ir.push(Instr::Const(c255.clone(), 255));
+                            let masked = self.fresh_temp();
+                            self.ir.push(Instr::And(masked.clone(), new, c255));
+                            masked
+                        } else {
+                            new
+                        };
+                        self.ir.push(Instr::StoreMem(ptr_t, stored));
+                        Ok(())
+                    }
+                }
+            }
+            Expr::Member { .. } if self.member_object_and_ty(target).is_err() => {
+                let var_ty = self.expr_ty(target)?;
+                let rt = self.expr_ty(rhs)?;
+                let ok = |t: Ty| t == Ty::Int || t == Ty::Char;
+                if !ok(rt.clone()) {
+                    return Err(LowerError::TypeMismatch(format!(
+                        "`+=` through `->` expects int or char RHS, got {rt:?}"
+                    )));
+                }
+                match var_ty {
+                    Ty::Bool | Ty::Struct(_) | Ty::Array(_, _) | Ty::Ptr(_) => Err(
+                        LowerError::TypeMismatch("`+=` through `->` expects int or char field".into()),
+                    ),
+                    Ty::Int | Ty::Char => {
+                        let (addr, _) = self.lower_ptr_member_address(target)?;
+                        let old = self.fresh_temp();
+                        self.ir.push(Instr::LoadMem(old.clone(), addr.clone()));
+                        let r = self.lower_expr(rhs)?;
+                        let new = self.fresh_temp();
+                        self.ir.push(Instr::Add(new.clone(), old, r));
+                        let stored = if var_ty == Ty::Char {
+                            let c255 = self.fresh_temp();
+                            self.ir.push(Instr::Const(c255.clone(), 255));
+                            let masked = self.fresh_temp();
+                            self.ir.push(Instr::And(masked.clone(), new, c255));
+                            masked
+                        } else {
+                            new
+                        };
+                        self.ir.push(Instr::StoreMem(addr, stored));
+                        Ok(())
+                    }
+                }
+            }
             Expr::Index { base, index } => {
                 let (first, var_ty, len) = self.resolve_array_expr(base)?;
                 if matches!(var_ty, Ty::Struct(_)) {
@@ -974,6 +1421,9 @@ impl<'a> LowerCtx<'a> {
             )),
             Ty::Array(_, _) => Err(LowerError::TypeMismatch(
                 "`+=` on an array member must use `[i]`".into(),
+            )),
+            Ty::Ptr(_) => Err(LowerError::TypeMismatch(
+                "`+=` cannot apply to a pointer variable".into(),
             )),
             Ty::Int => {
                 let rt = self.expr_ty(rhs)?;
@@ -1227,6 +1677,28 @@ impl<'a> LowerCtx<'a> {
                             }
                         }
                     }
+                } else if matches!(ty, Ty::Ptr(_)) {
+                    let slot = self.declare(name, ty.clone())?;
+                    match init {
+                        None => {
+                            let z = self.fresh_temp();
+                            self.ir.push(Instr::Const(z.clone(), 0));
+                            self.ir.push(Instr::StoreVar(slot, z));
+                        }
+                        Some(init_e) => {
+                            let allow_null = matches!(init_e, Expr::IntLit(0));
+                            if !allow_null {
+                                let init_ty = self.expr_ty(init_e)?;
+                                Self::expect_ty(
+                                    init_ty,
+                                    ty.clone(),
+                                    "pointer initializer vs declared type",
+                                )?;
+                            }
+                            let tmp = self.lower_expr(init_e)?;
+                            self.ir.push(Instr::StoreVar(slot, tmp));
+                        }
+                    }
                 } else {
                     let init_e = init.as_ref().ok_or_else(|| {
                         LowerError::TypeMismatch(
@@ -1309,6 +1781,53 @@ impl<'a> LowerCtx<'a> {
             }
             Stmt::Assign { target, value } => {
                 match target {
+                    Expr::Unary(UnaryOp::Deref, inner) => {
+                        let pointee = match self.expr_ty(inner)? {
+                            Ty::Ptr(b) => (*b).clone(),
+                            _ => {
+                                return Err(LowerError::TypeMismatch(
+                                    "assignment through `*` expects a pointer on the left".into(),
+                                ));
+                            }
+                        };
+                        if self.is_struct_ty(&pointee) || matches!(pointee, Ty::Array(..)) {
+                            return Err(LowerError::TypeMismatch(
+                                "assigning through `*` to struct or array is not supported".into(),
+                            ));
+                        }
+                        match &pointee {
+                            Ty::Char => match value {
+                                Expr::IntLit(n) => {
+                                    if *n < 0 || *n > 255 {
+                                        return Err(LowerError::TypeMismatch(format!(
+                                            "assign to `char` from integer must be 0..=255, got {}",
+                                            *n
+                                        )));
+                                    }
+                                }
+                                _ => {
+                                    let val_ty = self.expr_ty(value)?;
+                                    Self::expect_ty(val_ty, Ty::Char, "assignment through `*` to `char`")?;
+                                }
+                            },
+                            _ => {
+                                let val_ty = self.expr_ty(value)?;
+                                Self::expect_ty(val_ty, pointee.clone(), "assignment through `*`")?;
+                            }
+                        }
+                        let ptr_t = self.lower_expr(inner)?;
+                        let val_t = self.lower_expr(value)?;
+                        let stored = if pointee == Ty::Char {
+                            let c255 = self.fresh_temp();
+                            self.ir.push(Instr::Const(c255.clone(), 255));
+                            let masked = self.fresh_temp();
+                            self.ir.push(Instr::And(masked.clone(), val_t, c255));
+                            masked
+                        } else {
+                            val_t
+                        };
+                        self.ir.push(Instr::StoreMem(ptr_t, stored));
+                    }
                     Expr::Index { base, index } => {
                         let (first, elem_ty, len) = self.resolve_array_expr(base)?;
                         match elem_ty {
@@ -1351,6 +1870,60 @@ impl<'a> LowerCtx<'a> {
                             .push(Instr::StoreIndex(first, idx_t, stored, len));
                     }
                     _ => {
+                        if let Expr::Member { .. } = target {
+                            if self.member_object_and_ty(target).is_err() {
+                                let lhs_ty = self.expr_ty(target)?;
+                                if self.is_struct_ty(&lhs_ty)
+                                    || matches!(lhs_ty, Ty::Array(..))
+                                {
+                                    return Err(LowerError::TypeMismatch(
+                                        "assigning through `->` to struct or array is not supported"
+                                            .into(),
+                                    ));
+                                }
+                                match &lhs_ty {
+                                    Ty::Char => match value {
+                                        Expr::IntLit(n) => {
+                                            if *n < 0 || *n > 255 {
+                                                return Err(LowerError::TypeMismatch(format!(
+                                                    "assign to `char` from integer must be 0..=255, got {}",
+                                                    *n
+                                                )));
+                                            }
+                                        }
+                                        _ => {
+                                            let val_ty = self.expr_ty(value)?;
+                                            Self::expect_ty(
+                                                val_ty,
+                                                Ty::Char,
+                                                "assignment through `->` to `char`",
+                                            )?;
+                                        }
+                                    },
+                                    _ => {
+                                        let val_ty = self.expr_ty(value)?;
+                                        Self::expect_ty(
+                                            val_ty,
+                                            lhs_ty.clone(),
+                                            "assignment through `->`",
+                                        )?;
+                                    }
+                                }
+                                let (addr, _) = self.lower_ptr_member_address(target)?;
+                                let val_t = self.lower_expr(value)?;
+                                let stored = if lhs_ty == Ty::Char {
+                                    let c255 = self.fresh_temp();
+                                    self.ir.push(Instr::Const(c255.clone(), 255));
+                                    let masked = self.fresh_temp();
+                                    self.ir.push(Instr::And(masked.clone(), val_t, c255));
+                                    masked
+                                } else {
+                                    val_t
+                                };
+                                self.ir.push(Instr::StoreMem(addr, stored));
+                                return Ok(());
+                            }
+                        }
                         let lhs_ty = self.expr_ty(target)?;
                         if self.is_struct_ty(&lhs_ty) {
                             let rhs_ty = self.expr_ty(value)?;
@@ -1559,7 +2132,7 @@ fn slot_index(slot: &str) -> Result<usize, LowerError> {
 
 fn ty_size_words(ty: &Ty, layouts: &HashMap<String, StructLayout>) -> Result<usize, LowerError> {
     match ty {
-        Ty::Int | Ty::Bool | Ty::Char => Ok(1),
+        Ty::Int | Ty::Bool | Ty::Char | Ty::Ptr(_) => Ok(1),
         Ty::Struct(name) => layouts
             .get(name)
             .map(|l| l.size_words)
@@ -1959,6 +2532,40 @@ mod tests {
             ir.main.instrs.iter().any(|i| matches!(i, Instr::LoadIndex(_, _, _, 3))),
             "{ir:?}"
         );
+    }
+
+    #[test]
+    fn pointer_addr_deref_store_load_ir() {
+        let p = parse_program(
+            "int x = 1;\n\
+             int *p;\n\
+             p = &x;\n\
+             *p = 7;\n\
+             print_int(x);\n\
+             print_int(*p);",
+        )
+        .unwrap();
+        let ir = lower_program(&p).unwrap();
+        assert!(ir.main.instrs.iter().any(|i| matches!(i, Instr::AddrLocal(_, _, _))));
+        assert!(ir.main.instrs.iter().any(|i| matches!(i, Instr::StoreMem(_, _))));
+        assert!(ir.main.instrs.iter().any(|i| matches!(i, Instr::LoadMem(_, _))));
+    }
+
+    #[test]
+    fn struct_arrow_scalar_field() {
+        let p = parse_program(
+            "struct S { int a; };\n\
+             struct S s;\n\
+             struct S *p;\n\
+             p = &s;\n\
+             p->a = 9;\n\
+             print_int(s.a);\n\
+             print_int(p->a);",
+        )
+        .unwrap();
+        let ir = lower_program(&p).unwrap();
+        assert!(ir.main.instrs.iter().any(|i| matches!(i, Instr::StoreMem(_, _))));
+        assert!(ir.main.instrs.iter().any(|i| matches!(i, Instr::LoadMem(_, _))));
     }
 
     #[test]
