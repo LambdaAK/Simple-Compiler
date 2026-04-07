@@ -927,6 +927,7 @@ impl<'a> Parser<'a> {
             let op = match self.peek() {
                 Token::Star => Some(BinOp::Mul),
                 Token::Slash => Some(BinOp::Div),
+                Token::Percent => Some(BinOp::Mod),
                 _ => None,
             };
             let Some(op) = op else { break };
@@ -1250,6 +1251,26 @@ mod tests {
                     Box::new(Expr::IntLit(2)),
                     Box::new(Expr::IntLit(3)),
                 )),
+            ))
+        );
+    }
+
+    #[test]
+    fn mod_parses_at_mul_precedence() {
+        let p = parse_program("int x = 7 % 3 + 1;").unwrap();
+        let Item::Stmt(Stmt::VarDecl { init, .. }) = &p.items[0] else {
+            panic!("expected var decl");
+        };
+        assert_eq!(
+            init.as_ref(),
+            Some(&Expr::Binary(
+                BinOp::Add,
+                Box::new(Expr::Binary(
+                    BinOp::Mod,
+                    Box::new(Expr::IntLit(7)),
+                    Box::new(Expr::IntLit(3)),
+                )),
+                Box::new(Expr::IntLit(1)),
             ))
         );
     }

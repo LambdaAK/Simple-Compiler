@@ -151,7 +151,11 @@ fn collect_slots(instrs: &[Instr]) -> Vec<String> {
         match instr {
             Instr::RecvParam(d, _) | Instr::RecvParamStack(d, _) => note(d),
             Instr::Const(d, _) => note(d),
-            Instr::Add(d, a, b) | Instr::Sub(d, a, b) | Instr::Mul(d, a, b) | Instr::Div(d, a, b) => {
+            Instr::Add(d, a, b)
+            | Instr::Sub(d, a, b)
+            | Instr::Mul(d, a, b)
+            | Instr::Div(d, a, b)
+            | Instr::Mod(d, a, b) => {
                 note(d);
                 note(a);
                 note(b);
@@ -321,6 +325,13 @@ fn emit_instr(
             ldr_stack(o, "x9", oa(a));
             ldr_stack(o, "x10", oa(b));
             writeln!(o, "    sdiv x8, x9, x10").unwrap();
+            str_stack(o, "x8", oa(dst));
+        }
+        Instr::Mod(dst, a, b) => {
+            ldr_stack(o, "x9", oa(a));
+            ldr_stack(o, "x10", oa(b));
+            writeln!(o, "    sdiv x11, x9, x10").unwrap();
+            writeln!(o, "    msub x8, x11, x10, x9").unwrap();
             str_stack(o, "x8", oa(dst));
         }
         Instr::Neg(dst, a) => {

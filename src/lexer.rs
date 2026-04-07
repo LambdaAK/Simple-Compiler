@@ -69,6 +69,10 @@ pub fn lex(source: &str) -> Result<Vec<Token>, LexError> {
                 out.push(Token::Slash);
                 i += 1;
             }
+            b'%' => {
+                out.push(Token::Percent);
+                i += 1;
+            }
             b'(' => {
                 out.push(Token::LParen);
                 i += 1;

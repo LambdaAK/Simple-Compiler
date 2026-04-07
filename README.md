@@ -43,7 +43,7 @@ rel_expr  ::= add_expr { ("<" | "<=" | ">" | ">=") add_expr } ;
 
 add_expr  ::= mul_expr { ("+" | "-") mul_expr } ;
 
-mul_expr  ::= unary { ("*" | "/") unary } ;
+mul_expr  ::= unary { ("*" | "/" | "%") unary } ;
 
 unary     ::= ("-" | "!") unary | primary ;
 
@@ -62,7 +62,7 @@ These are enforced while **lowering** to IR; the grammar above accepts only the 
 - `if` **condition** must be **`bool`** (no `if (int)`). Same for **`while`** and **`for`** (omit **`for`** condition for an infinite loop).
 - **`char`** is a **single byte** (0–255). It is stored in a 64-bit stack word (zero-extended) in IR, like a tiny integer for codegen.
 - **`char` literals** have type **`char`**. An **`int`** literal **0..=255** may initialize or assign to **`char`** (C-style narrowing for constants).
-- **`char`** promotes like C: with **`int`** in **`+` `-` `*` `/`** (operands **`int`** or **`char`**, result **`int`**). Unary **`-`** on **`char`** yields **`int`**.
+- **`char`** promotes like C: with **`int`** in **`+` `-` `*` `/` `%`** (operands **`int`** or **`char`**, result **`int`**). Unary **`-`** on **`char`** yields **`int`**.
 - Comparisons **`==` … `>=`**: either **both `bool`** or **both numeric** (**`int`** / **`char`** in any mix); result **`bool`**.
 - Unary **`!`** only on **`bool`**. **`&&` / `||`**: **`bool`** only.
 - For **`int` / `bool` / `char`** declarations, the initializer must match the type, except **`char`** may use an **`int`** literal in **0..=255**.
