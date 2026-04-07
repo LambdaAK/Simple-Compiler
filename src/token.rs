@@ -38,6 +38,8 @@ pub enum Token {
     Star,
     /// `/`
     Slash,
+    /// `%`
+    Percent,
     /// `==`
     EqEq,
     /// `!=`
