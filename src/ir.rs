@@ -60,6 +60,8 @@ pub enum Instr {
     Mul(Temp, Temp, Temp),
     /// `dst = a / b` (signed; division by zero is undefined)
     Div(Temp, Temp, Temp),
+    /// `dst = a % b` (signed remainder; division by zero is undefined)
+    Mod(Temp, Temp, Temp),
 
     /// `dst = -a`
     Neg(Temp, Temp),

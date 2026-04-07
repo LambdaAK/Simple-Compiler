@@ -945,7 +945,7 @@ impl<'a> LowerCtx<'a> {
                 let lt = self.expr_ty(l)?;
                 let rt = self.expr_ty(r)?;
                 match op {
-                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => {
+                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => {
                         if matches!(lt, Ty::Struct(_))
                             || matches!(rt, Ty::Struct(_))
                             || matches!(lt, Ty::Array(..))
@@ -1121,6 +1121,7 @@ impl<'a> LowerCtx<'a> {
                     BinOp::Sub => Instr::Sub(dst.clone(), a, b),
                     BinOp::Mul => Instr::Mul(dst.clone(), a, b),
                     BinOp::Div => Instr::Div(dst.clone(), a, b),
+                    BinOp::Mod => Instr::Mod(dst.clone(), a, b),
                     BinOp::Eq => Instr::Eq(dst.clone(), a, b),
                     BinOp::Ne => Instr::Ne(dst.clone(), a, b),
                     BinOp::Lt => Instr::Lt(dst.clone(), a, b),
@@ -2335,6 +2336,16 @@ mod tests {
                 .instrs
                 .iter()
                 .any(|i| matches!(i, Instr::StoreVar(s, _) if s.starts_with('v'))),
+            "{ir:?}"
+        );
+    }
+
+    #[test]
+    fn lower_mod_expr() {
+        let p = parse_program("int x = 7 % 3;").unwrap();
+        let ir = lower_program(&p).unwrap();
+        assert!(
+            ir.main.instrs.iter().any(|i| matches!(i, Instr::Mod(_, _, _))),
             "{ir:?}"
         );
     }
